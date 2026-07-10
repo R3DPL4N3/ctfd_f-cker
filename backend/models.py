@@ -19,16 +19,14 @@ if TYPE_CHECKING:
 
 # Default model specs - Codex provider uses `codex app-server` and the local CLI login.
 DEFAULT_MODELS: list[str] = [
-    "codex/gpt-5.5",
-    "codex/gpt-5.4",
+    "codex/gpt-5.6-sol",
 ]
 
 # Context window sizes (tokens)
 CONTEXT_WINDOWS: dict[str, int] = {
     "us.anthropic.claude-opus-4-6-v1": 1_000_000,
     "claude-opus-4-6": 1_000_000,
-    "gpt-5.5": 1_000_000,
-    "gpt-5.4": 1_000_000,
+    "gpt-5.6-sol": 1_000_000,
     "gemini-3-flash-preview": 1_000_000,
 }
 
@@ -36,8 +34,7 @@ CONTEXT_WINDOWS: dict[str, int] = {
 VISION_MODELS: set[str] = {
     "us.anthropic.claude-opus-4-6-v1",
     "claude-opus-4-6",
-    "gpt-5.5",
-    "gpt-5.4",
+    "gpt-5.6-sol",
     "gemini-3-flash-preview",
 }
 

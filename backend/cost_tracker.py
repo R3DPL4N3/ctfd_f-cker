@@ -33,12 +33,7 @@ FALLBACK_PRICING: dict[str, dict[str, float]] = {
         "cached_input": 0.50,
         "output": 25.00,
     },
-    "gpt-5.5": {
-        "input": 2.50,
-        "cached_input": 0.25,
-        "output": 15.00,
-    },
-    "gpt-5.4": {
+    "gpt-5.6-sol": {
         "input": 2.50,
         "cached_input": 0.25,
         "output": 15.00,

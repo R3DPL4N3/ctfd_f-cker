@@ -29,8 +29,7 @@ logger = logging.getLogger(__name__)
 _rpc_counter = itertools.count(1)
 
 REASONING_EFFORT: dict[str, str] = {
-    "gpt-5.5": "xhigh",
-    "gpt-5.4": "xhigh",
+    "gpt-5.6-sol": "max",
 }
 
 COORDINATOR_PROMPT = """\
@@ -143,7 +142,7 @@ COORDINATOR_TOOLS = [
 class CodexCoordinator:
     """Coordinator using Codex App Server JSON-RPC."""
 
-    def __init__(self, deps: CoordinatorDeps, model: str = "gpt-5.5") -> None:
+    def __init__(self, deps: CoordinatorDeps, model: str = "gpt-5.6-sol") -> None:
         self.deps = deps
         self.model = model
         self._proc: asyncio.subprocess.Process | None = None
@@ -346,7 +345,7 @@ async def run_codex_coordinator(
     )
     deps.msg_port = msg_port
 
-    resolved_model = coordinator_model or "gpt-5.5"
+    resolved_model = coordinator_model or "gpt-5.6-sol"
     coordinator = CodexCoordinator(deps, model=resolved_model)
     await coordinator.start()
 

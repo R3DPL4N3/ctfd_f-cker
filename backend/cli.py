@@ -36,7 +36,7 @@ def _setup_logging(verbose: bool = False) -> None:
 @click.option("--challenge", default=None, help="Solve a single challenge directory")
 @click.option("--challenges-dir", default="challenges", help="Directory for challenge files")
 @click.option("--no-submit", is_flag=True, help="Dry run — don't submit flags")
-@click.option("--coordinator-model", default=None, help="Model for coordinator (default: gpt-5.5)")
+@click.option("--coordinator-model", default=None, help="Model for coordinator (default: gpt-5.6-sol)")
 @click.option("--coordinator", default="codex", type=click.Choice(["claude", "codex"]), help="Coordinator backend")
 @click.option("--max-challenges", default=10, type=int, help="Max challenges solved concurrently")
 @click.option("--msg-port", default=0, type=int, help="Operator message port (0 = auto)")

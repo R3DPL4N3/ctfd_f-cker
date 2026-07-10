@@ -47,8 +47,7 @@ _rpc_counter = itertools.count(1)
 
 # Per-model reasoning effort (only for models that support it)
 REASONING_EFFORT: dict[str, str] = {
-    "gpt-5.5": "xhigh",
-    "gpt-5.4": "xhigh",
+    "gpt-5.6-sol": "max",
 }
 
 

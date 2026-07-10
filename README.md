@@ -3,18 +3,6 @@
 uv run ctf-solve --challenges-dir challenges -v
 uv run ctf-solve --challenges-dir challenges --max-challenges 20 -v
 
-Autonomous CTF (Capture The Flag) solver that races multiple AI models against challenges in parallel. Built in a weekend, we used it to solve all 52/52 challenges and win **1st place at BSidesSF 2026 CTF**.
-
-Built by [Veria Labs](https://verialabs.com), founded by members of [.;,;.](https://ctftime.org/team/222911) (smiley), the [#1 US CTF team on CTFTime in 2024 and 2025](https://ctftime.org/stats/2024/US). We build AI agents that find and exploit real security vulnerabilities for large enterprises.
-
-## Results
-
-| Competition | Challenges Solved | Result |
-|-------------|:-:|--------|
-| **BSidesSF 2026** | 52/52 (100%) | **1st place ($1,500)** |
-
-The agent solves challenges across all categories — pwn, rev, crypto, forensics, web, and misc.
-
 ## How It Works
 
 A **coordinator** LLM manages the competition while **solver swarms** attack individual challenges. Each swarm runs multiple models simultaneously — the first to find the flag wins.
@@ -39,8 +27,7 @@ A **coordinator** LLM manages the competition while **solver swarms** attack ind
      | Swarm:          | | Swarm:         | | Swarm:         |
      | challenge-1     | | challenge-2    | | challenge-N    |
      |                 | |                | |                |
-     |  GPT-5.5 xhigh  | |  GPT-5.5 xhigh | |                |
-     |  GPT-5.4 xhigh  | |  GPT-5.4 xhigh | |     ...        |
+     |  GPT-5.6-sol max  | |  GPT-5.6-sol max  | |     ...        |
      +--------+--------+ +--------+-------+ +----------------+
               |                    |
      +--------v--------+  +-------v--------+
@@ -98,8 +85,7 @@ Default model lineup (configurable in `backend/models.py`):
 
 | Model | Provider | Notes |
 |-------|----------|-------|
-| GPT-5.5 | Codex CLI | xhigh reasoning |
-| GPT-5.4 | Codex CLI | xhigh reasoning |
+| GPT-5.6-sol | Codex CLI | max reasoning |
 
 ## Sandbox Tooling
 
@@ -149,6 +135,4 @@ spec such as `azure/...`, `bedrock/...`, `zen/...`, or `google/...`.
 - `codex` CLI logged in with `codex login`
 - `claude` CLI (optional, only for the Claude coordinator/solver)
 
-## Acknowledgements
 
-- [es3n1n/Eruditus](https://github.com/es3n1n/Eruditus) — CTFd interaction and HTML helpers in `pull_challenges.py`
