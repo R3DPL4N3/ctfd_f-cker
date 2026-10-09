@@ -239,8 +239,10 @@ def _merge_targets(existing: list[Target], incoming: Any) -> list[Target]:
         if current is None:
             by_key[item.key()] = item
             continue
-        current.hostname = current.hostname or item.hostname
-        current.domain = current.domain or item.domain
+        if item.hostname:
+            current.hostname = item.hostname
+        if item.domain:
+            current.domain = item.domain
         current.notes = _merge_notes(current.notes, item.notes)
     return list(by_key.values())
 
@@ -255,9 +257,15 @@ def _merge_credentials(existing: list[Credential], incoming: Any) -> list[Creden
         if current is None:
             by_key[item.key()] = item
             continue
-        current.password = current.password or item.password
-        current.hash = current.hash or item.hash
-        current.source = current.source or item.source
+        secret_updated = False
+        if item.password:
+            current.password = item.password
+            secret_updated = True
+        if item.hash:
+            current.hash = item.hash
+            secret_updated = True
+        if item.source and (secret_updated or not current.source):
+            current.source = item.source
         current.notes = _merge_notes(current.notes, item.notes)
     return list(by_key.values())
 
@@ -386,23 +394,20 @@ def prompt_projection(markdown: str, max_bytes: int = PROMPT_MEMORY_MAX_BYTES) -
     return clipped + "\n\n_Memory truncated for the prompt. Full state is on disk._\n"
 
 
-def redact_memory_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    """Safe view for traces/logs. Never include password or hash values."""
-    redacted = {key: value for key, value in payload.items() if key != "credentials"}
-    credentials = []
-    for raw in _as_items(payload.get("credentials")):
-        if not isinstance(raw, dict):
-            continue
-        credentials.append({
-            "username": raw.get("username"),
-            "domain": raw.get("domain"),
-            "password": "present" if _norm(raw.get("password")) else None,
-            "hash": "present" if _norm(raw.get("hash")) else None,
-            "source": raw.get("source"),
-        })
-    if credentials:
-        redacted["credentials"] = credentials
-    return redacted
+def memory_payload_trace_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    """Trace/log view of memory_update. Counts only — never payload contents."""
+    summary: dict[str, Any] = {
+        "targets_count": len(_as_items(payload.get("targets"))),
+        "credentials_count": len(_as_items(payload.get("credentials"))),
+        "sessions_count": len(_as_items(payload.get("sessions"))),
+        "networks_count": len(_as_items(payload.get("networks"))),
+        "findings_count": len(_as_items(payload.get("findings"))),
+        "artifacts_count": len(_as_items(payload.get("artifacts"))),
+    }
+    stage = _norm(payload.get("current_stage"))
+    if stage:
+        summary["current_stage"] = stage
+    return summary
 
 
 def _atomic_write(path: Path, text: str) -> None:
