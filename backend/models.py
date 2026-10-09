@@ -60,6 +60,14 @@ def resolve_model(spec: str, settings: Settings) -> Model:
                     model_id,
                     provider=BedrockProvider(bedrock_client=client),
                 )
+        case "openai":
+            provider_kwargs = {"api_key": settings.openai_api_key}
+            if settings.openai_base_url:
+                provider_kwargs["base_url"] = settings.openai_base_url
+            return OpenAIModel(
+                model_id,
+                provider=OpenAIProvider(**provider_kwargs),
+            )
         case "azure":
             return OpenAIModel(
                 model_id,
@@ -101,6 +109,10 @@ def resolve_model_settings(spec: str) -> ModelSettings:
                 bedrock_cache_tool_definitions=True,
                 bedrock_cache_messages=True,
             )
+        case "openai":
+            # OpenAI-compatible endpoints can expose models with very different
+            # output limits, so don't impose a provider-wide max_tokens value.
+            return OpenAIModelSettings()
         case "azure" | "zen":
             # Azure/Zen use OpenAI chat completions — server-side prompt caching
             # is automatic, no explicit config needed. Set max_tokens to avoid
