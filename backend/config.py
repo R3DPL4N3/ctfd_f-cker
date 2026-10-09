@@ -29,6 +29,8 @@ class Settings(BaseSettings):
     max_concurrent_challenges: int = 10
     max_attempts_per_challenge: int = 3
     container_memory_limit: str = "16g"
+    # Empty means all categories. CLI `--category/--categories` populates this whitelist.
+    allowed_categories: list[str] = []
     # How long a solved scenario solver keeps its sandbox while CTFd unlocks the next stage.
     scenario_unlock_wait_seconds: int = 120
 
