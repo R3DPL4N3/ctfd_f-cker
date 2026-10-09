@@ -124,6 +124,9 @@ class CTFdPoller:
                 return []
 
             events: list[PollEvent] = []
+            # This milestone treats unlock as "was hidden, now visible".
+            # TODO: also detect locked/anonymized → unlocked when CTFd exposes
+            # that state on already-visible stubs.
             for name in sorted(current_names - self._known_challenges):
                 stub = stubs_by_name.get(name) or {}
                 logger.info("New challenge detected: %s", name)

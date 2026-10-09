@@ -164,13 +164,34 @@ async def do_check_swarm_status(deps: CoordinatorDeps, challenge_name: str) -> s
     return json.dumps(swarm.get_status(), indent=2)
 
 
+def find_swarm_for_challenge(deps: CoordinatorDeps, challenge_name: str) -> Any | None:
+    """Find the living swarm for a challenge, including a rebound scenario swarm."""
+    swarm = deps.swarms.get(challenge_name)
+    if swarm is not None:
+        return swarm
+    session = deps.scenario_registry.find_session_by_challenge(challenge_name=challenge_name)
+    if session is None:
+        return None
+    return session.metadata.get("swarm")
+
+
 async def do_submit_flag(deps: CoordinatorDeps, challenge_name: str, flag: str) -> str:
+    """Submit only through an active swarm. Never call CTFd independently.
+
+    The coordinator LLM no longer exposes this tool. The function remains so any
+    leftover caller still hits the scenario lifecycle instead of bypassing it.
+    """
+    swarm = find_swarm_for_challenge(deps, challenge_name)
+    if swarm is None:
+        return (
+            "REFUSED — flags are submitted by solvers through the control plane. "
+            f"No active swarm for {challenge_name}."
+        )
     if deps.no_submit:
         return f'DRY RUN — would submit "{flag.strip()}" for {challenge_name}'
-    from backend.flag_submit import submit_flag_candidate
-
-    submission = await submit_flag_candidate(deps.ctfd, challenge_name, flag)
-    return submission.display
+    spec = swarm._winner_spec or (swarm.model_specs[0] if swarm.model_specs else "coordinator")
+    display, _confirmed = await swarm.try_submit_flag(flag, spec)
+    return display
 
 
 async def do_kill_swarm(deps: CoordinatorDeps, challenge_name: str) -> str:

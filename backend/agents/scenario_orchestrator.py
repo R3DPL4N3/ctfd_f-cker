@@ -91,6 +91,10 @@ async def handle_new_challenge_locked(
             deps.handled_challenges.add(challenge_name)
             return "continued"
         logger.info("Continuation unavailable for %s; spawning an independent solver", challenge_name)
+        session = deps.scenario_registry.get(decision.session_id)
+        waiting = session.metadata.get("swarm") if session is not None else None
+        if waiting is not None:
+            waiting.finish_scenario_wait()
 
     from backend.agents.coordinator_core import spawn_swarm_unlocked
 
@@ -230,6 +234,7 @@ def record_stage_result(deps: CoordinatorDeps, swarm: Any, challenge_name: str, 
         "writeup": result.writeup_path,
         "scenario_id": swarm.scenario_session.id if swarm.scenario_session else None,
         "cost_usd": result.cost_usd,
+        "step_count": result.step_count,
     }
     if swarm.scenario_registry is not None and swarm.scenario_session is not None:
         swarm.scenario_registry.record_stage(
@@ -238,4 +243,5 @@ def record_stage_result(deps: CoordinatorDeps, swarm: Any, challenge_name: str, 
             result.cost_usd,
             result.findings_summary,
             result.writeup_path,
+            step_count=getattr(result, "step_count", 0) or 0,
         )

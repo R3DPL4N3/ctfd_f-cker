@@ -17,7 +17,6 @@ from backend.agents.coordinator_core import (
     do_kill_swarm,
     do_read_solver_trace,
     do_spawn_swarm,
-    do_submit_flag,
 )
 from backend.agents.coordinator_loop import build_deps, run_event_loop
 from backend.codex_cli import resolve_codex_executable
@@ -53,6 +52,7 @@ CRITICAL RULES:
 - Cost is not a concern. Keep all swarms running.
 - Scenario continuation is owned by the control plane. If a message says a scenario
   continued, do not spawn a second swarm for that challenge.
+- Do not submit flags. Solvers report candidates through the control plane.
 - Give strategic hints to stuck solvers. Do not run scans, exploits, shells, or
   other challenge operations yourself.
 
@@ -86,15 +86,6 @@ COORDINATOR_TOOLS = [
             "type": "object",
             "properties": {"challenge_name": {"type": "string"}},
             "required": ["challenge_name"],
-        },
-    },
-    {
-        "name": "submit_flag",
-        "description": "Submit a flag to CTFd.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"challenge_name": {"type": "string"}, "flag": {"type": "string"}},
-            "required": ["challenge_name", "flag"],
         },
     },
     {
@@ -322,8 +313,6 @@ class CodexCoordinator:
             return await do_spawn_swarm(deps, args["challenge_name"])
         elif name == "check_swarm_status":
             return await do_check_swarm_status(deps, args["challenge_name"])
-        elif name == "submit_flag":
-            return await do_submit_flag(deps, args["challenge_name"], args["flag"])
         elif name == "kill_swarm":
             return await do_kill_swarm(deps, args["challenge_name"])
         elif name == "bump_agent":

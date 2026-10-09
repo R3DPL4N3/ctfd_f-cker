@@ -23,7 +23,6 @@ from backend.agents.coordinator_core import (
     do_kill_swarm,
     do_read_solver_trace,
     do_spawn_swarm,
-    do_submit_flag,
 )
 from backend.agents.coordinator_loop import build_deps, run_event_loop
 from backend.config import Settings
@@ -51,6 +50,7 @@ CRITICAL RULES:
 - Cost is not a concern. Keep all swarms running.
 - Scenario continuation is owned by the control plane. If a message says a scenario
   continued, do not spawn a second swarm for that challenge.
+- Do not submit flags. Solvers report candidates through the control plane.
 - Give strategic hints to stuck solvers. Do not run scans, exploits, shells, or
   other challenge operations yourself.
 
@@ -82,10 +82,6 @@ def _build_coordinator_mcp(deps: CoordinatorDeps):
     async def check_swarm_status(args: dict) -> dict:
         return _text(await do_check_swarm_status(deps, args["challenge_name"]))
 
-    @tool("submit_flag", "Submit a flag to CTFd.", {"challenge_name": str, "flag": str})
-    async def submit_flag(args: dict) -> dict:
-        return _text(await do_submit_flag(deps, args["challenge_name"], args["flag"]))
-
     @tool("kill_swarm", "Cancel all agents for a challenge.", {"challenge_name": str})
     async def kill_swarm(args: dict) -> dict:
         return _text(await do_kill_swarm(deps, args["challenge_name"]))
@@ -105,7 +101,7 @@ def _build_coordinator_mcp(deps: CoordinatorDeps):
     return create_sdk_mcp_server(
         name="coordinator", version="1.0.0",
         tools=[fetch_challenges, get_solve_status, spawn_swarm, check_swarm_status,
-               submit_flag, kill_swarm, bump_agent, broadcast, read_solver_trace],
+               kill_swarm, bump_agent, broadcast, read_solver_trace],
     )
 
 
@@ -129,7 +125,7 @@ async def run_claude_coordinator(
     allowed = {
         "mcp__coordinator__fetch_challenges", "mcp__coordinator__get_solve_status",
         "mcp__coordinator__spawn_swarm", "mcp__coordinator__check_swarm_status",
-        "mcp__coordinator__submit_flag", "mcp__coordinator__kill_swarm",
+        "mcp__coordinator__kill_swarm",
         "mcp__coordinator__bump_agent", "mcp__coordinator__broadcast",
         "mcp__coordinator__read_solver_trace",
         "ToolSearch",
