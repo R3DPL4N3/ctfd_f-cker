@@ -29,5 +29,7 @@ class Settings(BaseSettings):
     max_concurrent_challenges: int = 10
     max_attempts_per_challenge: int = 3
     container_memory_limit: str = "16g"
+    # How long a solved scenario solver keeps its sandbox while CTFd unlocks the next stage.
+    scenario_unlock_wait_seconds: int = 120
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}

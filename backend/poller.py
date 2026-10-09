@@ -25,9 +25,11 @@ class CTFdPoller:
 
     _known_challenges: set[str] = field(default_factory=set)
     _known_solved: set[str] = field(default_factory=set)
+    _ids_by_name: dict[str, int] = field(default_factory=dict)
     _event_queue: asyncio.Queue[PollEvent] = field(default_factory=asyncio.Queue)
     _task: asyncio.Task | None = field(default=None, repr=False)
     _stop: asyncio.Event = field(default_factory=asyncio.Event)
+    _poll_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     async def start(self) -> None:
         """Do initial poll (silent — no events) and start the background loop."""
@@ -43,10 +45,21 @@ class CTFdPoller:
         """Initial fetch — just populate known state, no events."""
         try:
             stubs = await self.ctfd.fetch_challenge_stubs()
-            self._known_challenges = {ch["name"] for ch in stubs}
+            self._remember_stubs(stubs)
             self._known_solved = await self.ctfd.fetch_solved_names()
         except Exception as e:
             logger.warning("Initial poll error: %s", e)
+
+    async def refresh(self) -> list[PollEvent]:
+        """Poll immediately and return new events without queueing them.
+
+        The caller routes these events before the normal auto-spawn path sees them.
+        """
+        async with self._poll_lock:
+            return await self._collect_events(enqueue=False)
+
+    def challenge_id(self, name: str) -> int | None:
+        return self._ids_by_name.get(name)
 
     async def stop(self) -> None:
         self._stop.set()
@@ -82,44 +95,64 @@ class CTFdPoller:
     def known_solved(self) -> set[str]:
         return set(self._known_solved)
 
-    async def _poll_once(self) -> None:
+    def _remember_stubs(self, stubs: list[dict]) -> None:
+        visible = [ch for ch in stubs if ch.get("name")]
+        self._known_challenges = {ch["name"] for ch in visible}
+        for challenge in visible:
+            if challenge.get("id") is not None:
+                self._ids_by_name[challenge["name"]] = challenge["id"]
+
+    async def _collect_events(self, *, enqueue: bool) -> list[PollEvent]:
         try:
             stubs = await self.ctfd.fetch_challenge_stubs()
-            current_names = {ch["name"] for ch in stubs}
+            visible = [ch for ch in stubs if ch.get("name")]
+            current_names = {ch["name"] for ch in visible}
+            stubs_by_name = {ch["name"]: ch for ch in visible}
             current_solved = await self.ctfd.fetch_solved_names()
 
             # Sanity check: if results look bogus compared to what we know, skip.
             if self._known_challenges and len(current_names) < len(self._known_challenges) // 2:
-                logger.warning(f"Poll returned suspicious data ({len(current_names)} challenges vs {len(self._known_challenges)} known) — skipping")
-                return
+                logger.warning(
+                    "Poll returned suspicious data (%d challenges vs %d known) — skipping",
+                    len(current_names),
+                    len(self._known_challenges),
+                )
+                return []
             # Don't let solved count regress (API might return empty on errors)
             if self._known_solved and not current_solved:
                 logger.warning("Poll returned 0 solved (had %d) — skipping", len(self._known_solved))
-                return
+                return []
 
-            # Detect new challenges
-            new_challenges = current_names - self._known_challenges
-            for name in new_challenges:
+            events: list[PollEvent] = []
+            for name in sorted(current_names - self._known_challenges):
+                stub = stubs_by_name.get(name) or {}
                 logger.info("New challenge detected: %s", name)
-                self._event_queue.put_nowait(
-                    PollEvent("new_challenge", name)
-                )
+                events.append(PollEvent(
+                    "new_challenge",
+                    name,
+                    {"id": stub.get("id"), "category": stub.get("category") or ""},
+                ))
 
-            # Detect newly solved
-            new_solves = current_solved - self._known_solved
-            for name in new_solves:
+            for name in sorted(current_solved - self._known_solved):
                 logger.info("Challenge solved: %s", name)
-                self._event_queue.put_nowait(
-                    PollEvent("challenge_solved", name)
-                )
+                events.append(PollEvent(
+                    "challenge_solved",
+                    name,
+                    {"id": self._ids_by_name.get(name)},
+                ))
 
-            self._known_challenges = current_names
+            self._remember_stubs(visible)
             self._known_solved = current_solved
-
+            if enqueue:
+                for event in events:
+                    self._event_queue.put_nowait(event)
+            return events
         except Exception as e:
-            logger.warning(f"Poll error: {e}")
+            logger.warning("Poll error: %s", e)
+            return []
 
     async def _loop(self) -> None:
         while not self._stop.is_set():
             await asyncio.sleep(self.interval_s)
-            await self._poll_once()
+            async with self._poll_lock:
+                await self._collect_events(enqueue=True)

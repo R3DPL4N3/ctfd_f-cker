@@ -36,7 +36,7 @@ def _setup_logging(verbose: bool = False) -> None:
 @click.option("--challenge", default=None, help="Solve a single challenge directory")
 @click.option("--challenges-dir", default="challenges", help="Directory for challenge files")
 @click.option("--no-submit", is_flag=True, help="Dry run — don't submit flags")
-@click.option("--coordinator-model", default=None, help="Model for coordinator (default: gpt-5.6-sol)")
+@click.option("--coordinator-model", default=None, help="Model for coordinator (default: gpt-5.6-luna)")
 @click.option("--coordinator", default="codex", type=click.Choice(["claude", "codex"]), help="Coordinator backend")
 @click.option("--max-challenges", default=10, type=int, help="Max challenges solved concurrently")
 @click.option("--msg-port", default=0, type=int, help="Operator message port (0 = auto)")
@@ -190,6 +190,9 @@ async def _run_coordinator(
         console.print(f"  {challenge}: {data.get('flag', 'no flag')}")
         if data.get("writeup"):
             console.print(f"    writeup: {data['writeup']}")
+    for summary in results.get("scenarios") or []:
+        console.print()
+        console.print(summary)
     console.print(f"\n[bold]Total cost: ${results.get('total_cost_usd', 0):.2f}[/bold]")
 
 

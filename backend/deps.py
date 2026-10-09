@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 from backend.cost_tracker import CostTracker
 from backend.ctfd import CTFdClient
 from backend.sandbox import DockerSandbox
+from backend.scenario import ScenarioRegistry
 
 if TYPE_CHECKING:
     from backend.message_bus import ChallengeMessageBus
@@ -55,3 +56,7 @@ class CoordinatorDeps:
     results: dict[str, dict] = field(default_factory=dict)
     challenge_dirs: dict[str, str] = field(default_factory=dict)
     challenge_metas: dict[str, Any] = field(default_factory=dict)
+    scenario_registry: ScenarioRegistry = field(default_factory=ScenarioRegistry)
+    routing_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    handled_challenges: set[str] = field(default_factory=set)
+    poller: Any = None

@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 from pathlib import Path
+from typing import Any
 
 from backend.deps import CoordinatorDeps
 from backend.prompts import ChallengeMeta
@@ -38,39 +39,73 @@ async def do_get_solve_status(deps: CoordinatorDeps) -> str:
 
 
 async def do_spawn_swarm(deps: CoordinatorDeps, challenge_name: str) -> str:
-    # Retire ALL finished swarms before checking capacity
-    finished = [
-        name for name, swarm in deps.swarms.items()
-        if swarm.cancel_event.is_set()
-        or (name in deps.swarm_tasks and deps.swarm_tasks[name].done())
-    ]
+    async with deps.routing_lock:
+        result = await spawn_swarm_unlocked(deps, challenge_name)
+        if result.startswith("Swarm spawned"):
+            deps.handled_challenges.add(challenge_name)
+        return result
+
+
+async def ensure_challenge_materials(deps: CoordinatorDeps, challenge_name: str) -> tuple[str, ChallengeMeta]:
+    """Pull a challenge into the local tree once, including id and prerequisites."""
+    if challenge_name not in deps.challenge_dirs:
+        challenges = await deps.ctfd.fetch_all_challenges()
+        challenge_data = next((c for c in challenges if c.get("name") == challenge_name), None)
+        if not challenge_data:
+            raise RuntimeError(f"Challenge '{challenge_name}' not found on CTFd")
+        output_dir = str(Path(deps.challenges_root))
+        challenge_dir = await deps.ctfd.pull_challenge(challenge_data, output_dir)
+        deps.challenge_dirs[challenge_name] = challenge_dir
+        deps.challenge_metas[challenge_name] = ChallengeMeta.from_yaml(Path(challenge_dir) / "metadata.yml")
+
+    meta = deps.challenge_metas[challenge_name]
+    if meta.id is None:
+        try:
+            meta.id = await deps.ctfd.get_challenge_id(challenge_name)
+        except Exception:
+            logger.debug("Could not resolve id for %s", challenge_name, exc_info=True)
+    return deps.challenge_dirs[challenge_name], meta
+
+
+def _retire_finished_swarms(deps: CoordinatorDeps) -> None:
+    """Drop swarms whose tasks are done. A live scenario session is not finished."""
+    finished: list[str] = []
+    for name, swarm in deps.swarms.items():
+        session = getattr(swarm, "scenario_session", None)
+        if session is not None and session.state != "stopped":
+            continue
+        task = deps.swarm_tasks.get(name)
+        if swarm.cancel_event.is_set() or (task is not None and task.done()):
+            finished.append(name)
     for name in finished:
-        del deps.swarms[name]
+        deps.swarms.pop(name, None)
         deps.swarm_tasks.pop(name, None)
 
-    active_count = len(deps.swarms)
-    if active_count >= deps.max_concurrent_challenges:
-        return f"At capacity ({active_count}/{deps.max_concurrent_challenges} challenges running). Wait for one to finish."
+
+async def spawn_swarm_unlocked(deps: CoordinatorDeps, challenge_name: str) -> str:
+    """Create a swarm. Caller must hold deps.routing_lock."""
+    _retire_finished_swarms(deps)
 
     if challenge_name in deps.swarms:
         return f"Swarm still running for {challenge_name}"
 
-    # Auto-pull challenge if needed
-    if challenge_name not in deps.challenge_dirs:
-        challenges = await deps.ctfd.fetch_all_challenges()
-        ch_data = next((c for c in challenges if c.get("name") == challenge_name), None)
-        if not ch_data:
-            return f"Challenge '{challenge_name}' not found on CTFd"
-        output_dir = str(Path(deps.challenges_root))
-        ch_dir = await deps.ctfd.pull_challenge(ch_data, output_dir)
-        deps.challenge_dirs[challenge_name] = ch_dir
-        deps.challenge_metas[challenge_name] = ChallengeMeta.from_yaml(Path(ch_dir) / "metadata.yml")
+    active_count = len(deps.swarms)
+    if active_count >= deps.max_concurrent_challenges:
+        return (
+            f"At capacity ({active_count}/{deps.max_concurrent_challenges} challenges running). "
+            "Wait for one to finish."
+        )
+
+    try:
+        _challenge_dir, meta = await ensure_challenge_materials(deps, challenge_name)
+    except RuntimeError as exc:
+        return str(exc)
 
     from backend.agents.swarm import ChallengeSwarm
 
     swarm = ChallengeSwarm(
-        challenge_dir=deps.challenge_dirs[challenge_name],
-        meta=deps.challenge_metas[challenge_name],
+        challenge_dir=_challenge_dir,
+        meta=meta,
         ctfd=deps.ctfd,
         cost_tracker=deps.cost_tracker,
         settings=deps.settings,
@@ -78,12 +113,14 @@ async def do_spawn_swarm(deps: CoordinatorDeps, challenge_name: str) -> str:
         no_submit=deps.no_submit,
         coordinator_inbox=deps.coordinator_inbox,
     )
+    if not deps.no_submit:
+        _attach_scenario(deps, swarm, meta)
     deps.swarms[challenge_name] = swarm
 
     async def _run_and_cleanup() -> None:
         result = await swarm.run()
-        # Flag already submitted/confirmed by solver's submit_fn — just record the result
-        if result and result.status == FLAG_FOUND:
+        # Stages are recorded as they are accepted. This covers a swarm with no scenario session.
+        if result and result.status == FLAG_FOUND and challenge_name not in deps.results:
             deps.results[challenge_name] = {
                 "flag": result.flag,
                 "submit": "DRY RUN" if deps.no_submit else "confirmed by solver",
@@ -93,6 +130,31 @@ async def do_spawn_swarm(deps: CoordinatorDeps, challenge_name: str) -> str:
     task = asyncio.create_task(_run_and_cleanup(), name=f"swarm-{challenge_name}")
     deps.swarm_tasks[challenge_name] = task
     return f"Swarm spawned for {challenge_name} with {len(deps.model_specs)} models"
+
+
+def _attach_scenario(deps: CoordinatorDeps, swarm: Any, meta: ChallengeMeta) -> None:
+    """Bind a new swarm to a scenario session without assuming a Codex solver."""
+    from backend.agents.scenario_orchestrator import on_flag_accepted, record_stage_result
+
+    session = deps.scenario_registry.create_session(
+        solver=None,
+        current_challenge_id=meta.id,
+        current_challenge_name=meta.name,
+        category=meta.category,
+        metadata={"tags": list(meta.tags), "swarm": swarm},
+    )
+    session.metadata["challenge_dirs"] = {meta.name: swarm.challenge_dir}
+    swarm.scenario_mode = True
+    swarm.scenario_session = session
+    swarm.scenario_registry = deps.scenario_registry
+    swarm.routing_lock = deps.routing_lock
+    swarm.scenario_writeup_dir = str(Path(deps.challenges_root).parent / "scenario-writeups")
+    swarm.on_flag_accepted = lambda challenge_name, flag: on_flag_accepted(
+        deps, swarm, challenge_name, flag
+    )
+    swarm.on_stage_solved = lambda challenge_name, result: record_stage_result(
+        deps, swarm, challenge_name, result
+    )
 
 
 async def do_check_swarm_status(deps: CoordinatorDeps, challenge_name: str) -> str:
@@ -105,11 +167,10 @@ async def do_check_swarm_status(deps: CoordinatorDeps, challenge_name: str) -> s
 async def do_submit_flag(deps: CoordinatorDeps, challenge_name: str, flag: str) -> str:
     if deps.no_submit:
         return f'DRY RUN — would submit "{flag.strip()}" for {challenge_name}'
-    try:
-        result = await deps.ctfd.submit_flag(challenge_name, flag)
-        return result.display
-    except Exception as e:
-        return f"submit_flag error: {e}"
+    from backend.flag_submit import submit_flag_candidate
+
+    submission = await submit_flag_candidate(deps.ctfd, challenge_name, flag)
+    return submission.display
 
 
 async def do_kill_swarm(deps: CoordinatorDeps, challenge_name: str) -> str:

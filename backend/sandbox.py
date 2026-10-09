@@ -293,3 +293,47 @@ class DockerSandbox:
                 pass
             self.workspace_dir = ""
         logger.info("Sandbox stopped")
+
+
+def stage_challenge_into_workspace(workspace_dir: str, challenge_dir: str, challenge_name: str) -> str:
+    """Copy a challenge into the sandbox workspace without recreating the container.
+
+    The copy lands on the existing host workspace mount, so /challenge/workspace
+    inside the container updates in place. No extra host mounts are added.
+    """
+    import shutil
+
+    if not workspace_dir:
+        raise RuntimeError("Sandbox workspace is not available")
+
+    slug = _challenge_slug(challenge_name)
+    host_root = Path(workspace_dir)
+    stage_host = host_root / "stages" / slug
+    if stage_host.exists():
+        shutil.rmtree(stage_host)
+    stage_host.mkdir(parents=True)
+
+    distfiles = Path(challenge_dir) / "distfiles"
+    if distfiles.is_dir():
+        shutil.copytree(distfiles, stage_host / "distfiles")
+    metadata = Path(challenge_dir) / "metadata.yml"
+    if metadata.is_file():
+        shutil.copy2(metadata, stage_host / "metadata.yml")
+
+    current = host_root / "current-challenge"
+    if current.is_symlink() or current.is_file():
+        current.unlink()
+    elif current.exists():
+        shutil.rmtree(current)
+    current.symlink_to(Path("stages") / slug, target_is_directory=True)
+    return f"/challenge/workspace/stages/{slug}"
+
+
+def _challenge_slug(name: str) -> str:
+    import re
+
+    slug = name.lower().strip()
+    slug = re.sub(r'[<>:"/\\|?*.\x00-\x1f]', "", slug)
+    slug = re.sub(r"[\s_]+", "-", slug)
+    slug = re.sub(r"-+", "-", slug).strip("-")
+    return slug or "challenge"

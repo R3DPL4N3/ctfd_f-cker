@@ -32,6 +32,7 @@ class CTFdClient:
     _csrf_token: str = ""
     _logged_in: bool = False
     _challenge_ids: dict[str, int] = field(default_factory=dict)
+    _details: dict[int, dict[str, Any]] = field(default_factory=dict)
 
     async def _ensure_client(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -166,9 +167,21 @@ class CTFdClient:
         for stub in data.get("data", []):
             if stub.get("type") == "hidden":
                 continue
-            detail = await self._get(f"/challenges/{stub['id']}")
-            challenges.append(detail["data"])
+            detail = await self.fetch_challenge_detail(stub["id"])
+            challenges.append(detail)
         return challenges
+
+    async def fetch_challenge_detail(self, challenge_id: int) -> dict[str, Any]:
+        """Fetch one challenge, including prerequisite metadata when CTFd provides it."""
+        cached = self._details.get(int(challenge_id))
+        if cached is not None:
+            return cached
+        data = await self._get(f"/challenges/{int(challenge_id)}")
+        detail = data["data"]
+        if detail.get("name") and detail.get("id") is not None:
+            self._challenge_ids[detail["name"]] = detail["id"]
+        self._details[int(detail["id"])] = detail
+        return detail
 
     async def fetch_solved_names(self) -> set[str]:
         try:
@@ -244,10 +257,14 @@ class CTFdClient:
         except Exception:
             pass
 
+        from backend.scenario_router import parse_prerequisite_ids
+
         tags = [t["value"] if isinstance(t, dict) else str(t) for t in (challenge.get("tags") or [])]
         meta = {
+            "id": challenge.get("id"),
             "name": name,
             "category": challenge.get("category", ""),
+            "requirements": parse_prerequisite_ids(challenge),
             "description": desc.strip(),
             "value": challenge.get("value", 0),
             "connection_info": challenge.get("connection_info") or "",

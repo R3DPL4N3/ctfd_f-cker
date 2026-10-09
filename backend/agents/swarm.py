@@ -6,14 +6,16 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from backend.agents.solver import Solver
 from backend.cost_tracker import CostTracker
 from backend.ctfd import CTFdClient
+from backend.flag_submit import FlagOutcome, submit_flag_candidate
 from backend.message_bus import ChallengeMessageBus
 from backend.models import DEFAULT_MODELS, provider_from_spec
 from backend.prompts import ChallengeMeta
+from backend.scenario import trace_scenario
 from backend.solver_base import (
     CANCELLED,
     ERROR,
@@ -54,6 +56,18 @@ class ChallengeSwarm:
     _submitted_flags: set[str] = field(default_factory=set)  # dedup exact flags
     _last_submit_time: dict[str, float] = field(default_factory=dict)  # per-model last submit timestamp
     message_bus: ChallengeMessageBus = field(default_factory=ChallengeMessageBus)
+    scenario_mode: bool = False
+    scenario_session: Any = None
+    scenario_registry: Any = None
+    on_flag_accepted: Any = None
+    on_stage_solved: Any = None
+    routing_lock: asyncio.Lock | None = None
+    scenario_writeup_dir: str = "scenario-writeups"
+    _winner_spec: str | None = None
+    _continuation_decided: bool = False
+    _wait_generation: int = 0
+    _continuation_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+    _solver_tasks: dict[str, asyncio.Task] = field(default_factory=dict)
 
     def _create_solver(self, model_spec: str):
         """Create the right solver type based on provider.
@@ -141,18 +155,31 @@ class ChallengeSwarm:
     SUBMISSION_COOLDOWNS = [0, 30, 120, 300, 600]  # 0s, 30s, 2min, 5min, 10min
 
     async def try_submit_flag(self, flag: str, model_spec: str) -> tuple[str, bool]:
-        """Cooldown-gated, deduplicated flag submission. Returns (display, is_confirmed)."""
+        """Cooldown-gated flag submission through the control plane.
+
+        Only an explicit CTFd rejection is cached. Transport and auth failures stay retryable.
+        """
+        acquired = False
+        try:
+            if self.routing_lock is not None:
+                await self.routing_lock.acquire()
+                acquired = True
+            return await self._try_submit_flag_inner(flag, model_spec)
+        finally:
+            if acquired and self.routing_lock is not None:
+                self.routing_lock.release()
+
+    async def _try_submit_flag_inner(self, flag: str, model_spec: str) -> tuple[str, bool]:
+        accepted = False
+        normalized = flag.strip()
         async with self._flag_lock:
             if self.confirmed_flag:
                 return f"ALREADY SOLVED — flag already confirmed: {self.confirmed_flag}", True
 
-            normalized = flag.strip()
-
-            # Dedup exact flags across all models
+            session_id = self.scenario_session.id if self.scenario_session else None
             if normalized in self._submitted_flags:
                 return "INCORRECT — already tried this exact flag.", False
 
-            # Escalating cooldown after incorrect submissions
             wrong_count = self._submit_count.get(model_spec, 0)
             cooldown_idx = min(wrong_count, len(self.SUBMISSION_COOLDOWNS) - 1)
             cooldown = self.SUBMISSION_COOLDOWNS[cooldown_idx]
@@ -168,25 +195,155 @@ class ChallengeSwarm:
                         False,
                     )
 
-            self._submitted_flags.add(normalized)
-
-            from backend.tools.core import do_submit_flag
-            display, is_confirmed = await do_submit_flag(self.ctfd, self.meta.name, flag)
-            if is_confirmed:
+            trace_scenario(
+                "candidate_flag",
+                self.scenario_session,
+                challenge=self.meta.name,
+                session_id=session_id,
+                solver=model_spec,
+            )
+            submission = await submit_flag_candidate(self.ctfd, self.meta.name, normalized)
+            if submission.outcome == FlagOutcome.ACCEPTED:
                 self.confirmed_flag = normalized
-            else:
+                self._submitted_flags.add(normalized)
+                self._winner_spec = model_spec
+                solver = self.solvers.get(model_spec)
+                if self.scenario_session is not None and solver is not None:
+                    self.scenario_session.solver = solver
+                    try:
+                        self.scenario_session.sandbox_id = solver.sandbox.container_id
+                    except Exception:
+                        logger.debug("Sandbox id unavailable", exc_info=True)
+                if self.scenario_session is None:
+                    trace_scenario(
+                        "flag_accepted",
+                        challenge=self.meta.name,
+                        solver=model_spec,
+                    )
+                accepted = True
+            elif submission.outcome == FlagOutcome.REJECTED:
+                self._submitted_flags.add(normalized)
                 self._submit_count[model_spec] = wrong_count + 1
                 self._last_submit_time[model_spec] = time.monotonic()
-            return display, is_confirmed
+                trace_scenario(
+                    "flag_rejected",
+                    self.scenario_session,
+                    challenge=self.meta.name,
+                    session_id=session_id,
+                    solver=model_spec,
+                )
+            else:
+                trace_scenario(
+                    "flag_submission_error",
+                    self.scenario_session,
+                    challenge=self.meta.name,
+                    session_id=session_id,
+                    solver=model_spec,
+                    outcome=submission.outcome.value,
+                )
+            display = submission.display
+
+        if accepted and self.on_flag_accepted is not None:
+            try:
+                await self.on_flag_accepted(self.meta.name, normalized)
+            except Exception:
+                logger.exception("[%s] Flag-accepted hook failed", self.meta.name)
+        return display, accepted
+
+    def offer_continuation(self, meta: ChallengeMeta, challenge_dir: str) -> bool:
+        """Queue the next stage for the living winner. Safe to call before the solver waits."""
+        if not self.scenario_mode or self._continuation_decided:
+            return False
+        self._continuation_decided = True
+        self._continuation_queue.put_nowait((meta, challenge_dir))
+        return True
+
+    def finish_scenario_wait(self) -> None:
+        """Unblock a solver that is waiting for an unlock. Does not destroy the sandbox."""
+        if self._continuation_decided:
+            return
+        self._continuation_decided = True
+        self._continuation_queue.put_nowait(None)
+
+    async def wait_for_continuation(self) -> tuple[ChallengeMeta, str] | None:
+        timeout_task: asyncio.Task | None = None
+        if not self._continuation_decided:
+            timeout_task = asyncio.create_task(
+                self._expire_wait(self._wait_generation, self._unlock_wait_seconds()),
+                name=f"scenario-wait-{self.meta.name}",
+            )
+        try:
+            return await self._continuation_queue.get()
+        finally:
+            if timeout_task is not None:
+                timeout_task.cancel()
+                try:
+                    await timeout_task
+                except asyncio.CancelledError:
+                    pass
+
+    async def _expire_wait(self, generation: int, delay: float) -> None:
+        await asyncio.sleep(delay)
+        if generation != self._wait_generation or self._continuation_decided:
+            return
+        trace_scenario(
+            "scenario_timeout",
+            self.scenario_session,
+            challenge=self.meta.name,
+            session_id=self.scenario_session.id if self.scenario_session else None,
+            wait_seconds=delay,
+        )
+        logger.info("Scenario unlock wait expired for %s", self.meta.name)
+        self.finish_scenario_wait()
+
+    def _unlock_wait_seconds(self) -> float:
+        return float(getattr(self.settings, "scenario_unlock_wait_seconds", 120))
+
+    def _prepare_next_stage(self, meta: ChallengeMeta, challenge_dir: str) -> None:
+        self.meta = meta
+        self.challenge_dir = challenge_dir
+        self.confirmed_flag = None
+        self._submitted_flags.clear()
+        self._submit_count.clear()
+        self._last_submit_time.clear()
+        self._continuation_decided = False
+        self._wait_generation += 1
+        while not self._continuation_queue.empty():
+            try:
+                self._continuation_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+    async def _stop_siblings(self, winner_spec: str) -> None:
+        pending = [
+            task
+            for spec, task in self._solver_tasks.items()
+            if spec != winner_spec and not task.done()
+        ]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    def _finalize_scenario(self) -> None:
+        session = self.scenario_session
+        if session is None or self.scenario_registry is None or session.state == "stopped":
+            return
+        self.scenario_registry.stop_session(session.id, output_dir=self.scenario_writeup_dir)
 
     async def _run_solver(self, model_spec: str) -> SolverResult | None:
         solver = self._create_solver(model_spec)
         self.solvers[model_spec] = solver
+        current = asyncio.current_task()
+        if current is not None:
+            self._solver_tasks[model_spec] = current
 
         try:
             result, final_solver = await self._run_solver_loop(solver, model_spec)
             solver = final_solver
             return result
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.error(f"[{self.meta.name}/{model_spec}] Fatal: {e}", exc_info=True)
             return None
@@ -215,6 +372,7 @@ class ChallengeSwarm:
                 await self.message_bus.post(model_spec, result.findings_summary[:500])
 
             if result.status == FLAG_FOUND:
+                stage_name = self.meta.name
                 try:
                     writeup_path = write_solve_writeup(
                         self.challenge_dir,
@@ -225,13 +383,33 @@ class ChallengeSwarm:
                     result.writeup_path = str(writeup_path)
                 except Exception as e:
                     logger.warning(f"[{self.meta.name}] Writeup generation failed: {e}")
-                self.cancel_event.set()
                 self.winner = result
-                msg = f"[{self.meta.name}] Flag found by {model_spec}: {result.flag}"
+                if self.on_stage_solved is not None:
+                    try:
+                        self.on_stage_solved(stage_name, result)
+                    except Exception:
+                        logger.exception("[%s] Stage result hook failed", stage_name)
+                msg = f"[{stage_name}] Flag found by {model_spec}: {result.flag}"
                 if result.writeup_path:
                     msg += f" (writeup: {result.writeup_path})"
                 logger.info(msg)
-                return result, solver
+
+                if not self.scenario_mode or self.no_submit:
+                    self.cancel_event.set()
+                    return result, solver
+
+                await self._stop_siblings(model_spec)
+                continuation = await self.wait_for_continuation()
+                if continuation is None:
+                    return result, solver
+                next_meta, next_dir = continuation
+                if not hasattr(solver, "continue_with_challenge"):
+                    logger.warning("[%s] Solver cannot continue an existing session", model_spec)
+                    return result, solver
+                self._prepare_next_stage(next_meta, next_dir)
+                await solver.continue_with_challenge(next_meta, next_dir)
+                logger.info("[%s] Reused solver for %s", model_spec, next_meta.name)
+                continue
 
             if result.status == CANCELLED:
                 break
@@ -281,6 +459,17 @@ class ChallengeSwarm:
 
     async def run(self) -> SolverResult | None:
         """Run all solvers in parallel. Returns the winner's result or None."""
+        try:
+            return await self._run_all()
+        finally:
+            pending = [task for task in self._solver_tasks.values() if not task.done()]
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            self._finalize_scenario()
+
+    async def _run_all(self) -> SolverResult | None:
         tasks = [
             asyncio.create_task(self._run_solver(spec), name=f"solver-{spec}")
             for spec in self.model_specs
@@ -293,12 +482,20 @@ class ChallengeSwarm:
                 for task in done:
                     try:
                         result = task.result()
-                    except Exception:
+                    except (Exception, asyncio.CancelledError):
                         continue
                     if result and result.status == FLAG_FOUND:
+                        winner_task = self._solver_tasks.get(self._winner_spec or "")
+                        if (
+                            self.scenario_mode
+                            and winner_task is not None
+                            and winner_task is not task
+                            and not winner_task.done()
+                        ):
+                            continue
                         self.cancel_event.set()
-                        for p in pending:
-                            p.cancel()
+                        for waiting in pending:
+                            waiting.cancel()
                         await asyncio.gather(*pending, return_exceptions=True)
                         return result
 
@@ -306,17 +503,20 @@ class ChallengeSwarm:
 
             self.cancel_event.set()
             return self.winner
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.error(f"[{self.meta.name}] Swarm error: {e}", exc_info=True)
             self.cancel_event.set()
-            for t in tasks:
-                t.cancel()
+            for task in tasks:
+                task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             return None
 
     def kill(self) -> None:
         """Cancel all agents for this challenge."""
         self.cancel_event.set()
+        self.finish_scenario_wait()
 
     def get_status(self) -> dict:
         """Get per-agent progress and findings."""

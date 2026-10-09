@@ -29,6 +29,7 @@ def write_solve_writeup(
         f"- Points: {meta.value or '?'}",
         f"- Solver: `{model_spec}`",
         f"- Flag: `{result.flag or 'unknown'}`",
+        f"- Cost: ${result.cost_usd:.2f}",
         "",
         "## Challenge",
         meta.description.strip() or "_No description provided._",
@@ -45,6 +46,45 @@ def write_solve_writeup(
     ]
     out_path.write_text("\n".join(lines), encoding="utf-8")
     return out_path
+
+
+def write_scenario_writeup(session: Any, output_dir: str | Path = "scenario-writeups") -> Path:
+    """Write the chain-level attack path. Per-challenge writeups stay beside each challenge."""
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{session.id}.md"
+    stages = list(session.metadata.get("stage_costs") or [])
+    names = " → ".join(session.solved_challenge_names) or session.current_challenge_name
+    lines = [
+        f"# {session.id}",
+        "",
+        "## Attack path",
+        names or "_No stages recorded._",
+        "",
+        "Operational secrets that are not required to explain the objective are omitted.",
+        "",
+        "## Stages",
+    ]
+    if not stages:
+        lines.append("_No stage records._")
+    for stage in stages:
+        lines.extend([
+            "",
+            f"### {stage.get('challenge', '?')}",
+            f"- Cost: ${float(stage.get('cost_usd') or 0):.2f}",
+            f"- Writeup: `{stage.get('writeup')}`" if stage.get("writeup") else "- Writeup: _not captured_",
+            "",
+            stage.get("findings") or "_No solver summary captured._",
+        ])
+    lines.extend(["", "## Cost", "", format_cost(session), ""])
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+    return out_path
+
+
+def format_cost(session: Any) -> str:
+    from backend.scenario import format_scenario_cost
+
+    return format_scenario_cost(session)
 
 
 def _read_trace_events(log_path: str) -> list[dict[str, Any]]:
