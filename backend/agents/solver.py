@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from copy import copy
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -13,6 +14,7 @@ from pydantic_ai.messages import ModelRequest, UserPromptPart
 from pydantic_ai.toolsets import FunctionToolset
 from pydantic_ai.toolsets.abstract import ToolsetTool
 from pydantic_ai.toolsets.wrapper import WrapperToolset
+from pydantic_ai.usage import RunUsage
 
 from backend.cost_tracker import CostTracker
 from backend.ctfd import CTFdClient
@@ -41,6 +43,8 @@ from backend.tools.sandbox import (
     bash,
     check_findings,
     list_files,
+    memory_get,
+    memory_update,
     notify_coordinator,
     read_file,
     web_fetch,
@@ -68,10 +72,16 @@ class TracingToolset(WrapperToolset[SolverDeps]):
         self.step_counter[0] += 1
         step = self.step_counter[0]
 
-        self.tracer.tool_call(name, tool_args, step)
+        traced_args = tool_args
+        if name == "memory_update":
+            from backend.scenario_memory import memory_payload_trace_summary
+            traced_args = memory_payload_trace_summary(tool_args if isinstance(tool_args, dict) else {})
+        self.tracer.tool_call(name, traced_args, step)
 
-        # Loop detection
-        loop_status = self.loop_detector.check(name, tool_args)
+        if name in {"memory_get", "memory_update"}:
+            loop_status = None
+        else:
+            loop_status = self.loop_detector.check(name, traced_args)
         if loop_status == "break":
             logger.warning(f"Loop break on {name} at step {step}")
             self.tracer.event("loop_break", tool=name, step=step)
@@ -81,7 +91,10 @@ class TracingToolset(WrapperToolset[SolverDeps]):
         result = await self.wrapped.call_tool(name, tool_args, ctx, tool)
 
         result_str = str(result) if result is not None else ""
-        self.tracer.tool_result(name, result_str, step)
+        traced_result = result_str
+        if name in {"memory_get", "memory_update"}:
+            traced_result = "scenario memory updated" if name == "memory_update" else "scenario memory read"
+        self.tracer.tool_result(name, traced_result, step)
 
         # Inject loop warning alongside result on "warn" level
         if loop_status == "warn":
@@ -104,7 +117,8 @@ class TracingToolset(WrapperToolset[SolverDeps]):
 def _build_toolset(deps: SolverDeps) -> FunctionToolset[SolverDeps]:
     """Build the raw toolset for a solver agent."""
     tools = [bash, read_file, write_file, list_files, submit_flag, web_fetch,
-             webhook_create, webhook_get_requests, check_findings, notify_coordinator]
+             webhook_create, webhook_get_requests, check_findings, notify_coordinator,
+             memory_get, memory_update]
     if deps.use_vision:
         tools.append(view_image)
     return FunctionToolset(tools=tools, max_retries=4)
@@ -160,12 +174,16 @@ class Solver:
         self._confirmed: bool = False
         self._findings: str = ""
         self._pending_prompt: str | None = None
+        self._run_usage = RunUsage()
+        self._usage_committed = False
+        self._memory = None
 
     async def start(self) -> None:
         """Start the sandbox and build the agent."""
         if not self.sandbox._container:
             await self.sandbox.start()
         self.deps.workspace_dir = self.sandbox.workspace_dir
+        self._init_memory()
 
         arch_result = await self.sandbox.exec("uname -m", timeout_s=10)
         container_arch = arch_result.stdout.strip() or "unknown"
@@ -175,6 +193,7 @@ class Solver:
             self.meta,
             distfile_names,
             container_arch=container_arch,
+            include_memory=True,
         )
 
         model = resolve_model(self.model_spec, self.settings)
@@ -206,6 +225,8 @@ class Solver:
         assert self._agent is not None
 
         t0 = time.monotonic()
+        self._run_usage = RunUsage()
+        self._usage_committed = False
 
         try:
             from pydantic_ai.usage import UsageLimits
@@ -221,23 +242,11 @@ class Solver:
                 deps=self.deps,
                 message_history=self._messages if self._messages else None,
                 usage_limits=UsageLimits(request_limit=None),
+                usage=self._run_usage,
             )
 
             duration = time.monotonic() - t0
-            usage = result.usage
-
-            self.cost_tracker.record(
-                self.agent_name, usage, self.model_id,
-                provider_spec=provider_from_spec(self.model_spec),
-                duration_seconds=duration,
-            )
-
-            agent_usage = self.cost_tracker.by_agent.get(self.agent_name)
-            self.tracer.usage(
-                usage.input_tokens, usage.output_tokens,
-                usage.cache_read_tokens,
-                agent_usage.cost_usd if agent_usage else 0.0,
-            )
+            self._commit_run_usage(duration_seconds=duration)
 
             self._messages = result.all_messages()
 
@@ -271,11 +280,13 @@ class Solver:
             return self._result(GAVE_UP)
 
         except asyncio.CancelledError:
+            self._commit_run_usage(duration_seconds=time.monotonic() - t0)
             return self._result(CANCELLED)
         except Exception as e:
             logger.error(f"[{self.agent_name}] Error: {e}", exc_info=True)
             self._findings = f"Error: {e}"
             self.tracer.event("error", error=str(e))
+            self._commit_run_usage(duration_seconds=time.monotonic() - t0)
             return self._result(ERROR)
 
     async def continue_with_challenge(self, challenge_meta: ChallengeMeta, challenge_dir: str) -> None:
@@ -296,13 +307,25 @@ class Solver:
         self.deps.confirmed_flag = None
         self._confirmed = False
         self._flag = None
+        memory_summary = None
+        if self._memory is not None:
+            self._memory.advance_stage(previous, challenge_meta.name)
+            memory_summary = self._memory.compact_markdown()
+        else:
+            self._init_memory()
+            if self._memory is not None:
+                self._memory.advance_stage(previous, challenge_meta.name)
+                memory_summary = self._memory.compact_markdown()
         self._pending_prompt = build_continuation_prompt(
             challenge_meta,
             container_path,
             list_distfiles(challenge_dir),
+            memory_summary=memory_summary,
         )
         self.agent_name = f"{challenge_meta.name}/{self.model_id}"
         self._step_count[0] = 0
+        self._run_usage = RunUsage()
+        self._usage_committed = False
         self.loop_detector.reset()
         self.tracer.event(
             "scenario_continued",
@@ -332,10 +355,64 @@ class Solver:
         self.tracer.event("bump", insights=insights[:500])
         logger.info(f"[{self.agent_name}] Bumped with sibling insights")
 
+    def _commit_run_usage(self, duration_seconds: float = 0.0) -> None:
+        """Record this run's usage once. Cumulative snapshots are not summed again."""
+        if self._usage_committed:
+            return
+        self._usage_committed = True
+        usage = copy(self._run_usage)
+        if not usage.has_values() and usage.requests == 0:
+            return
+        self.cost_tracker.record(
+            self.agent_name, usage, self.model_id,
+            provider_spec=provider_from_spec(self.model_spec),
+            duration_seconds=duration_seconds,
+        )
+        agent_usage = self.cost_tracker.by_agent.get(self.agent_name)
+        self.tracer.usage(
+            usage.input_tokens, usage.output_tokens,
+            usage.cache_read_tokens,
+            agent_usage.cost_usd if agent_usage else 0.0,
+        )
+
+    def _init_memory(self) -> None:
+        workspace = getattr(self.sandbox, "workspace_dir", "") if self.sandbox else ""
+        if not workspace:
+            return
+        from backend.scenario_memory import ScenarioMemoryStore
+
+        self._memory = ScenarioMemoryStore(workspace, current_stage=self.meta.name)
+        self._memory.ensure()
+        self.deps.memory = self._memory
+
+    @property
+    def memory_path(self) -> str | None:
+        if self._memory is None:
+            return None
+        return str(self._memory.json_path)
+
+    def bind_scenario(self, scenario_id: str) -> None:
+        if self._memory is None:
+            self._init_memory()
+        if self._memory is not None:
+            self._memory.set_scenario_id(scenario_id)
+
     def _result(self, status: str, run_steps: int | None = None, run_cost: float | None = None) -> SolverResult:
+        self._commit_run_usage()
         agent_usage = self.cost_tracker.by_agent.get(self.agent_name)
         cost = agent_usage.cost_usd if agent_usage else 0.0
-        self.tracer.event("finish", status=status, flag=self._flag, confirmed=self._confirmed, cost_usd=round(cost, 4))
+        usage = self._run_usage
+        self.tracer.event(
+            "finish",
+            status=status,
+            flag=self._flag,
+            confirmed=self._confirmed,
+            cost_usd=round(cost, 4),
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            cache_read_tokens=usage.cache_read_tokens,
+            requests=usage.requests,
+        )
         return SolverResult(
             flag=self._flag,
             status=status,

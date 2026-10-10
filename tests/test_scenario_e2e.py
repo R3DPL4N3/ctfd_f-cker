@@ -478,3 +478,48 @@ async def test_concurrent_unlock_routing_is_idempotent(tmp_path, monkeypatch) ->
     continuation = await swarm.wait_for_continuation()
     assert continuation is not None
     assert continuation[0].name == "AD-02"
+
+
+class EmptyPrereqCTFd(FakeCTFd):
+    @staticmethod
+    def _challenge(challenge_id: int, name: str, prerequisites: list[int]) -> dict:
+        return FakeCTFd._challenge(challenge_id, name, [])
+
+
+@pytest.mark.asyncio
+async def test_empty_requirements_chain_reuses_same_scenario(tmp_path, monkeypatch) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    sandbox = FakeSandbox(str(workspace))
+    created: list[FakeContinuingSolver] = []
+    _patch_solver(monkeypatch, sandbox, created)
+    spawn_names: list[str] = []
+    real_spawn = spawn_swarm_unlocked
+
+    async def _count_spawn(deps, challenge_name: str) -> str:
+        spawn_names.append(challenge_name)
+        return await real_spawn(deps, challenge_name)
+
+    monkeypatch.setattr(
+        "backend.agents.coordinator_core.spawn_swarm_unlocked",
+        _count_spawn,
+    )
+
+    deps, _ctfd, _poller = await _deps(tmp_path, ctfd=EmptyPrereqCTFd(tmp_path / "challenges"))
+    outcome = await handle_new_challenge(deps, "AD-01", {"id": 1})
+    assert outcome == "spawned"
+    task = next(iter(deps.swarm_tasks.values()))
+    await asyncio.wait_for(task, timeout=5)
+
+    assert spawn_names == ["AD-01"]
+    assert len(created) == 1
+    solver = created[0]
+    assert solver.continue_calls == [("AD-01", "AD-02"), ("AD-02", "AD-03")]
+    assert solver.sandbox is sandbox
+    assert sandbox.workspace_dir == str(workspace)
+    session = next(iter(deps.scenario_registry._sessions.values()))
+    assert session.solver is solver
+    assert session.solved_challenge_names == ["AD-01", "AD-02", "AD-03"]
+    memory = ScenarioMemoryStore(workspace).load()
+    assert memory.current_stage == "AD-03"
+    assert memory.completed_stages == ["AD-01", "AD-02"]

@@ -11,8 +11,15 @@ from dataclasses import dataclass
 from typing import Any
 
 from backend.deps import CoordinatorDeps
-from backend.scenario import trace_scenario
-from backend.scenario_router import RouteDecision, decide_continuation, parse_prerequisite_ids
+from backend.scenario import ScenarioSession, trace_scenario
+from backend.scenario_router import (
+    RouteDecision,
+    causal_continuation_decision,
+    decide_continuation,
+    has_explicit_relationship,
+    parse_prerequisite_ids,
+    scenario_tags,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -27,12 +34,23 @@ class ChallengeFacts:
     prerequisite_ids: list[int]
 
 
+@dataclass(frozen=True)
+class ImmediateUnlockContext:
+    """Post-solve poller.refresh() that is still holding the routing lock."""
+
+    source_session_id: str
+    source_challenge_id: int | str | None
+    source_challenge_name: str
+    new_challenge_count: int
+
+
 async def handle_new_challenge(
     deps: CoordinatorDeps,
     challenge_name: str,
     details: dict[str, Any] | None = None,
     *,
     unlocked: bool = False,
+    causal: ImmediateUnlockContext | None = None,
 ) -> str:
     """Return 'continued', 'spawned', 'skipped', or 'failed'."""
     async with deps.routing_lock:
@@ -41,6 +59,7 @@ async def handle_new_challenge(
             challenge_name,
             details or {},
             unlocked=unlocked,
+            causal=causal,
         )
 
 
@@ -50,6 +69,7 @@ async def handle_new_challenge_locked(
     details: dict[str, Any] | None = None,
     *,
     unlocked: bool = False,
+    causal: ImmediateUnlockContext | None = None,
 ) -> str:
     """Route one challenge. Caller must hold deps.routing_lock."""
     details = details or {}
@@ -77,13 +97,18 @@ async def handle_new_challenge_locked(
         prerequisite_ids=facts.prerequisite_ids,
         tags=facts.tags,
     )
+    if decision.action == "new" and causal is not None:
+        source = deps.scenario_registry.get(causal.source_session_id)
+        fallback = causal_continuation_decision(
+            source,
+            new_challenge_count=causal.new_challenge_count,
+            prerequisite_ids=facts.prerequisite_ids,
+            tags=facts.tags,
+        )
+        if fallback is not None:
+            decision = fallback
+    _log_route_decision(decision, facts, causal)
     trace_scenario("continuation_decision", challenge=challenge_name, **decision.as_dict())
-    logger.info(
-        "Continuation decision for %s: %s (%s)",
-        challenge_name,
-        decision.action,
-        decision.reason,
-    )
 
     if decision.action == "continue" and decision.session_id:
         continued = await _continue_session(deps, decision, facts)
@@ -127,13 +152,22 @@ async def on_flag_accepted(deps: CoordinatorDeps, swarm: Any, challenge_name: st
 
     poller = deps.poller
     if poller is None:
+        await _maybe_finish_terminal_wait(deps, swarm, session)
         return
     try:
         events = await poller.refresh()
     except Exception:
         logger.warning("Immediate CTFd refresh failed after %s", challenge_name, exc_info=True)
+        await _maybe_finish_terminal_wait(deps, swarm, session)
         return
 
+    new_challenges = [event for event in events if event.kind == "new_challenge"]
+    causal = ImmediateUnlockContext(
+        source_session_id=session.id,
+        source_challenge_id=challenge_id,
+        source_challenge_name=challenge_name,
+        new_challenge_count=len(new_challenges),
+    )
     for event in events:
         if event.kind != "new_challenge":
             continue
@@ -142,7 +176,9 @@ async def on_flag_accepted(deps: CoordinatorDeps, swarm: Any, challenge_name: st
             event.challenge_name,
             event.details,
             unlocked=True,
+            causal=causal,
         )
+    await _maybe_finish_terminal_wait(deps, swarm, session)
 
 
 async def load_challenge_facts(
@@ -214,6 +250,84 @@ async def _continue_session(
     except Exception:
         logger.debug("Could not notify coordinator of continuation", exc_info=True)
     return True
+
+
+def _log_route_decision(
+    decision: RouteDecision,
+    facts: ChallengeFacts,
+    causal: ImmediateUnlockContext | None,
+) -> None:
+    source = causal
+    causal_ok = (
+        causal is not None
+        and causal.new_challenge_count == 1
+        and not has_explicit_relationship(facts.prerequisite_ids, facts.tags)
+    )
+    logger.info(
+        "Continuation decision for %s: %s reason=%s session_id=%s "
+        "challenge_id=%s prerequisite_ids=%s scenario_tags=%s "
+        "source_scenario_id=%s source_challenge_id=%s causal_fallback_candidate=%s deterministic=%s",
+        facts.name,
+        decision.action,
+        decision.reason,
+        decision.session_id,
+        facts.id,
+        facts.prerequisite_ids,
+        sorted(scenario_tags(facts.tags)),
+        source.source_session_id if source else None,
+        source.source_challenge_id if source else None,
+        causal_ok,
+        decision.deterministic,
+    )
+
+
+async def inspect_unlock_horizon(deps: CoordinatorDeps, session: ScenarioSession) -> str:
+    """Return 'open', 'closed', or 'unknown'. Hidden listings stay unknown."""
+    includes_hidden = bool(getattr(deps.ctfd, "listing_includes_hidden", False))
+    try:
+        challenges = await deps.ctfd.fetch_all_challenges()
+    except Exception:
+        logger.debug("Unlock horizon probe failed for %s", session.id, exc_info=True)
+        return "unknown"
+
+    solved_ids: set[int] = set()
+    for value in session.solved_challenge_ids:
+        try:
+            solved_ids.add(int(value))
+        except (TypeError, ValueError):
+            continue
+    solved_names = set(session.solved_challenge_names)
+    session_tags = scenario_tags(session.metadata.get("tags"))
+
+    for challenge in challenges:
+        name = str(challenge.get("name") or "")
+        if not name or name in solved_names:
+            continue
+        prereqs = parse_prerequisite_ids(challenge)
+        tags = [
+            tag["value"] if isinstance(tag, dict) else str(tag)
+            for tag in (challenge.get("tags") or [])
+        ]
+        if prereqs and solved_ids & set(prereqs):
+            return "open"
+        if session_tags and session_tags & scenario_tags(tags):
+            return "open"
+
+    if includes_hidden:
+        return "closed"
+    return "unknown"
+
+
+async def _maybe_finish_terminal_wait(deps: CoordinatorDeps, swarm: Any, session: ScenarioSession) -> None:
+    if session.state != "waiting_for_unlock":
+        return
+    horizon = await inspect_unlock_horizon(deps, session)
+    if horizon != "closed":
+        return
+    logger.info("Scenario %s is terminal; skipping unlock wait", session.id)
+    finish = getattr(swarm, "finish_scenario_wait", None)
+    if callable(finish):
+        finish()
 
 
 def _rebind_swarm(deps: CoordinatorDeps, old_name: str, new_name: str, swarm: Any) -> None:

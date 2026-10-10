@@ -48,6 +48,8 @@ class CTFdClient:
     _logged_in: bool = False
     _challenge_ids: dict[str, int] = field(default_factory=dict)
     _details: dict[int, dict[str, Any]] = field(default_factory=dict)
+    # Player listings omit hidden stages. Admin/test doubles may set this True.
+    listing_includes_hidden: bool = False
 
     async def _ensure_client(self) -> httpx.AsyncClient:
         if self._client is None:
