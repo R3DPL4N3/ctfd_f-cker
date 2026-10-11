@@ -332,6 +332,15 @@ def test_compaction_controller_two_cycles_with_hysteresis() -> None:
     assert ctrl.observe_usage(20_000, window) == "rearm"
 
 
+def test_compaction_controller_accepts_200k_context_window() -> None:
+    ctrl = CompactionController()
+    window = 200_000
+    assert ctrl.observe_usage(140_001, window) == "request"
+    assert ctrl.in_progress is True
+    assert ctrl.observe_usage(99_999, window) == "rearm"
+    assert ctrl.in_progress is False
+
+
 @pytest.mark.asyncio
 async def test_compaction_rearms_across_two_solver_cycles(tmp_path) -> None:
     solver = CodexSolver(
