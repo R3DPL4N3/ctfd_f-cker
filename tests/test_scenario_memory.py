@@ -2,18 +2,19 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from backend.agents.codex_solver import CodexSolver
+from backend.agents.codex_solver import CodexSolver, CompactionController
 from backend.cost_tracker import CostTracker
 from backend.prompts import ChallengeMeta, build_continuation_prompt, build_prompt
 from backend.scenario_memory import (
     ScenarioMemoryStore,
     empty_state,
-    redact_memory_payload,
+    memory_payload_trace_summary,
     render_markdown,
 )
 
@@ -120,15 +121,118 @@ def test_markdown_hides_plaintext_secrets(tmp_path) -> None:
     assert "s3cret" in store.load().credentials[0].password
 
 
-def test_redact_memory_payload_strips_secrets() -> None:
-    redacted = redact_memory_payload({
-        "credentials": [{"username": "root", "password": "hunter2", "hash": "aabb"}],
-        "targets": [{"host": "10.0.0.1"}],
+def test_incoming_password_replaces_stale_value(tmp_path) -> None:
+    store = _store(tmp_path)
+    store.update({
+        "credentials": [{
+            "username": "svc_sql",
+            "domain": "corp.local",
+            "password": "OldPassword",
+        }],
     })
-    assert redacted["credentials"][0]["password"] == "present"
-    assert redacted["credentials"][0]["hash"] == "present"
-    assert "hunter2" not in str(redacted)
-    assert "aabb" not in str(redacted)
+    store.update({
+        "credentials": [{
+            "username": "svc_sql",
+            "domain": "CORP.LOCAL",
+            "password": "VerifiedPassword",
+        }],
+    })
+    state = store.load()
+    assert len(state.credentials) == 1
+    assert state.credentials[0].password == "VerifiedPassword"
+
+
+def test_incoming_hash_replaces_stale_value(tmp_path) -> None:
+    store = _store(tmp_path)
+    store.update({
+        "credentials": [{
+            "username": "svc_sql",
+            "domain": "corp.local",
+            "hash": "stalehash",
+        }],
+    })
+    store.update({
+        "credentials": [{
+            "username": "SVC_SQL",
+            "domain": "corp.local",
+            "hash": "verifiedhash",
+        }],
+    })
+    state = store.load()
+    assert len(state.credentials) == 1
+    assert state.credentials[0].hash == "verifiedhash"
+
+
+def test_empty_credential_fields_do_not_erase(tmp_path) -> None:
+    store = _store(tmp_path)
+    store.update({
+        "credentials": [{
+            "username": "svc_sql",
+            "domain": "corp.local",
+            "password": "KeepMe",
+            "hash": "keep-hash",
+            "source": "Linux 101",
+        }],
+    })
+    store.update({
+        "credentials": [{
+            "username": "svc_sql",
+            "domain": "corp.local",
+            "password": "",
+            "hash": None,
+        }],
+    })
+    cred = store.load().credentials[0]
+    assert cred.password == "KeepMe"
+    assert cred.hash == "keep-hash"
+    assert cred.source == "Linux 101"
+
+
+def test_memory_trace_summary_never_contains_secrets() -> None:
+    payload = {
+        "current_stage": "Linux 102",
+        "credentials": [{
+            "username": "svc_sql",
+            "domain": "corp.local",
+            "password": "SuperSecret123!",
+            "hash": "aabbccddeeff",
+            "notes": ["NTLM: abcdefdeadbeef"],
+        }],
+        "findings": ["svc_sql password is SuperSecret123!"],
+        "targets": [{"host": "10.10.10.5", "notes": ["token=leakme-token"]}],
+        "sessions": [{
+            "type": "ssh",
+            "host": "10.10.10.5",
+            "username": "root",
+            "notes": ["password SuperSecret123!"],
+        }],
+        "networks": [{"cidr": "10.20.0.0/24", "notes": ["SuperSecret123!"]}],
+        "artifacts": ["/challenge/workspace/loot SuperSecret123!"],
+    }
+    summary = memory_payload_trace_summary(payload)
+    dumped = json.dumps(summary)
+    for secret in (
+        "SuperSecret123!",
+        "aabbccddeeff",
+        "abcdefdeadbeef",
+        "leakme-token",
+        "svc_sql",
+        "corp.local",
+        "10.10.10.5",
+        "NTLM",
+        "root",
+        "loot",
+    ):
+        assert secret not in dumped
+    assert summary == {
+        "targets_count": 1,
+        "credentials_count": 1,
+        "sessions_count": 1,
+        "networks_count": 1,
+        "findings_count": 1,
+        "artifacts_count": 1,
+        "current_stage": "Linux 102",
+    }
 
 
 def test_continuation_prompt_includes_memory_summary() -> None:
@@ -208,4 +312,103 @@ async def test_memory_persists_across_codex_continuation(tmp_path) -> None:
     assert "PERSISTENT SCENARIO MEMORY" in solver._pending_prompt
     assert "10.10.10.5" in solver._pending_prompt
     assert "s3cret" not in solver._pending_prompt
+    solver.tracer.close()
+
+
+def test_compaction_controller_two_cycles_with_hysteresis() -> None:
+    ctrl = CompactionController()
+    window = 100_000
+    assert ctrl.observe_usage(80_001, window) == "request"
+    assert ctrl.in_progress is True
+    assert ctrl.reminder is True
+    assert ctrl.observe_usage(90_000, window) is None
+    ctrl.mark_observed()
+    assert ctrl.in_progress is True
+    assert ctrl.observe_usage(60_000, window) is None
+    assert ctrl.observe_usage(49_999, window) == "rearm"
+    assert ctrl.in_progress is False
+    assert ctrl.observe_usage(80_001, window) == "request"
+    assert ctrl.observe_usage(85_000, window) is None
+    assert ctrl.observe_usage(20_000, window) == "rearm"
+
+
+@pytest.mark.asyncio
+async def test_compaction_rearms_across_two_solver_cycles(tmp_path) -> None:
+    solver = CodexSolver(
+        model_spec="codex/gpt-5.6-sol",
+        challenge_dir=str(tmp_path / "linux-101"),
+        meta=ChallengeMeta(name="Linux 101", category="Linux", id=1),
+        ctfd=object(),
+        cost_tracker=CostTracker(),
+        settings=SimpleNamespace(sandbox_image="ctf-sandbox", container_memory_limit="4g"),
+    )
+    solver._thread_id = "THREAD_A"
+    solver.sandbox.workspace_dir = str(tmp_path / "workspace")
+    (tmp_path / "workspace").mkdir()
+    solver._init_memory()
+    rpc: list[str] = []
+
+    async def fake_rpc(method: str, params=None) -> dict:
+        rpc.append(method)
+        return {"result": {}}
+
+    solver._rpc = fake_rpc  # type: ignore[method-assign]
+    window = 100_000
+
+    await solver._handle_compaction_pressure(80_001, window)
+    assert rpc == ["thread/compact/start"]
+    assert solver._compaction.reminder is True
+    await solver._handle_compaction_pressure(90_000, window)
+    assert rpc == ["thread/compact/start"]
+
+    solver._compaction.reminder = False
+    solver._on_compaction_event({
+        "turnId": "turn-c1",
+        "item": {"type": "contextCompaction", "id": "item-c1"},
+    })
+    assert solver._compaction.reminder is True
+    assert "turn-c1" in solver._compact_turn_ids
+    assert solver._thread_id == "THREAD_A"
+
+    await solver._handle_compaction_pressure(60_000, window)
+    assert rpc == ["thread/compact/start"]
+    await solver._handle_compaction_pressure(40_000, window)
+    assert solver._compaction.in_progress is False
+
+    await solver._handle_compaction_pressure(80_001, window)
+    assert rpc == ["thread/compact/start", "thread/compact/start"]
+    solver._on_compaction_event({
+        "turnId": "turn-c2",
+        "item": {"type": "contextCompaction", "id": "item-c2"},
+    })
+    await solver._handle_compaction_pressure(30_000, window)
+    await solver._handle_compaction_pressure(80_001, window)
+    assert rpc == ["thread/compact/start", "thread/compact/start", "thread/compact/start"]
+    solver.tracer.close()
+
+
+@pytest.mark.asyncio
+async def test_compaction_rearms_from_token_drop_without_completion(tmp_path) -> None:
+    solver = CodexSolver(
+        model_spec="codex/gpt-5.6-sol",
+        challenge_dir=str(tmp_path / "linux-101"),
+        meta=ChallengeMeta(name="Linux 101", category="Linux", id=1),
+        ctfd=object(),
+        cost_tracker=CostTracker(),
+        settings=SimpleNamespace(sandbox_image="ctf-sandbox", container_memory_limit="4g"),
+    )
+    solver._thread_id = "THREAD_A"
+    rpc: list[str] = []
+
+    async def fake_rpc(method: str, params=None) -> dict:
+        rpc.append(method)
+        return {"result": {}}
+
+    solver._rpc = fake_rpc  # type: ignore[method-assign]
+    window = 100_000
+    await solver._handle_compaction_pressure(80_001, window)
+    await solver._handle_compaction_pressure(85_000, window)
+    await solver._handle_compaction_pressure(20_000, window)
+    await solver._handle_compaction_pressure(80_001, window)
+    assert rpc == ["thread/compact/start", "thread/compact/start"]
     solver.tracer.close()

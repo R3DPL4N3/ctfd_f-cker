@@ -50,6 +50,74 @@ REASONING_EFFORT: dict[str, str] = {
     "gpt-5.6-sol": "high",
 }
 
+# Proactive compaction for small-context models. Hysteresis avoids compact loops.
+COMPACT_ELIGIBLE_WINDOW_MAX = 200_000
+COMPACT_REQUEST_RATIO = 0.70
+COMPACT_REARM_RATIO = 0.50
+_COMPACTION_ITEM_TYPES = {"contextCompaction", "compacted"}
+
+
+class CompactionController:
+    """Reusable compaction gate for a single persistent Codex thread."""
+
+    def __init__(self) -> None:
+        self.in_progress = False
+        self.reminder = False
+
+    def observe_usage(self, total_tokens: int, context_window: int | None) -> str | None:
+        """Return 'request', 'rearm', or None. Never request twice above the re-arm floor."""
+        action = None
+        if self.in_progress and _below_compact_rearm(total_tokens, context_window):
+            self.in_progress = False
+            action = "rearm"
+        if (
+            not self.in_progress
+            and _compact_window_eligible(context_window)
+            and total_tokens > context_window * COMPACT_REQUEST_RATIO
+        ):
+            self.in_progress = True
+            self.reminder = True
+            return "request"
+        return action
+
+    def mark_observed(self) -> None:
+        """Codex reported compaction (requested or automatic). Keep the guard until re-arm."""
+        self.in_progress = True
+        self.reminder = True
+
+    def mark_failed(self) -> None:
+        self.in_progress = False
+
+
+def _compact_window_eligible(context_window: int | None) -> bool:
+    return bool(context_window) and context_window < COMPACT_ELIGIBLE_WINDOW_MAX
+
+
+def _below_compact_rearm(total_tokens: int, context_window: int | None) -> bool:
+    return bool(context_window) and total_tokens < context_window * COMPACT_REARM_RATIO
+
+
+def _compaction_item_type(params: dict | None) -> str:
+    if not isinstance(params, dict):
+        return ""
+    item = params.get("item", params)
+    if not isinstance(item, dict):
+        return ""
+    return str(item.get("type") or "")
+
+
+def _compaction_turn_id(params: dict | None) -> str:
+    if not isinstance(params, dict):
+        return ""
+    turn_id = params.get("turnId")
+    turn = params.get("turn")
+    if not turn_id and isinstance(turn, dict):
+        turn_id = turn.get("id")
+    item = params.get("item")
+    if not turn_id and isinstance(item, dict):
+        turn_id = item.get("turnId")
+    return str(turn_id or "")
+
 
 def _next_id() -> int:
     return next(_rpc_counter)
@@ -199,8 +267,9 @@ class CodexSolver:
         self._pending_prompt: str | None = None
         self._structured_output: dict | None = None
         self._turn_error: str | None = None
-        self._compact_requested = False
-        self._compact_reminder = False
+        self._compaction = CompactionController()
+        self._compact_turn_ids: set[str] = set()
+        self._compact_task: asyncio.Task | None = None
         self._memory = None
         self._pending_responses: dict[int, asyncio.Future] = {}
         self._reader_task: asyncio.Task | None = None
@@ -331,6 +400,12 @@ class CodexSolver:
             if method == "item/tool/call" and msg_id is not None:
                 await self._handle_tool_call(msg_id, params)
 
+            elif method == "compacted" or (
+                method in {"item/started", "item/completed"}
+                and _compaction_item_type(params) in _COMPACTION_ITEM_TYPES
+            ):
+                self._on_compaction_event(params)
+
             # Notification: item completed — assistant text arrives here
             elif method == "item/completed":
                 item = params.get("item", params)
@@ -350,6 +425,11 @@ class CodexSolver:
             # Notification: turn completed — signals the turn is done
             elif method == "turn/completed":
                 turn = params.get("turn", {})
+                turn_id = str(turn.get("id") or params.get("turnId") or "")
+                if turn_id and turn_id in self._compact_turn_ids:
+                    self._compact_turn_ids.discard(turn_id)
+                    self._on_compaction_event(params)
+                    continue
                 status = turn.get("status", "")
                 if status == "failed":
                     error = turn.get("error", {})
@@ -381,25 +461,11 @@ class CodexSolver:
                 last = token_usage.get("last", {})
                 total = token_usage.get("total", {})
 
-                # Proactive compaction at 70% context window (only for small-context models like spark)
                 context_window = token_usage.get("modelContextWindow")
                 total_tokens = total.get("totalTokens", 0)
-                if (
-                    not self._compact_requested
-                    and context_window
-                    and context_window < 200_000
-                    and total_tokens > context_window * 0.7
-                ):
-                    self._compact_requested = True
-                    logger.info(f"[{self.agent_name}] Requesting compaction ({total_tokens}/{context_window} tokens)")
-                    try:
-                        if self._memory is not None:
-                            self._memory.ensure()
-                        self._compact_reminder = True
-                        await self._rpc("thread/compact/start", {"threadId": self._thread_id})
-                        self.tracer.event("compact_requested", tokens=total_tokens, window=context_window)
-                    except Exception as e:
-                        logger.warning(f"[{self.agent_name}] Compaction request failed: {e}")
+                self._compact_task = asyncio.create_task(
+                    self._handle_compaction_pressure(total_tokens, context_window)
+                )
 
                 self.cost_tracker.record_tokens(
                     self.agent_name, self.model_id,
@@ -430,11 +496,14 @@ class CodexSolver:
         self._step_count += 1
         traced_args = args
         if tool_name == "memory_update":
-            from backend.scenario_memory import redact_memory_payload
-            traced_args = redact_memory_payload(args if isinstance(args, dict) else {})
+            from backend.scenario_memory import memory_payload_trace_summary
+            traced_args = memory_payload_trace_summary(args if isinstance(args, dict) else {})
         self.tracer.tool_call(tool_name, traced_args, self._step_count)
 
-        loop_status = self.loop_detector.check(tool_name, traced_args)
+        if tool_name in {"memory_get", "memory_update"}:
+            loop_status = None
+        else:
+            loop_status = self.loop_detector.check(tool_name, traced_args)
         if loop_status == "break":
             self.tracer.event("loop_break", tool=tool_name, step=self._step_count)
             result = "Loop detected — try a completely different approach."
@@ -532,14 +601,14 @@ class CodexSolver:
         else:
             prompt_text = "Continue solving. Try a different approach."
 
-        if self._compact_reminder:
+        if self._compaction.reminder:
             prompt_text = (
                 "Durable scenario state lives in /challenge/workspace/scenario-state.json "
                 "and /challenge/workspace/scenario-memory.md. "
                 "Call memory_get instead of reconstructing from conversation.\n\n"
                 + prompt_text
             )
-            self._compact_reminder = False
+            self._compaction.reminder = False
 
         try:
             self._turn_done.clear()
@@ -660,6 +729,40 @@ class CodexSolver:
             self._init_memory()
         if self._memory is not None:
             self._memory.set_scenario_id(scenario_id)
+
+    def _on_compaction_event(self, params: dict | None = None) -> None:
+        turn_id = _compaction_turn_id(params)
+        if turn_id:
+            self._compact_turn_ids.add(turn_id)
+        self._compaction.mark_observed()
+        if self._memory is not None:
+            self._memory.ensure()
+        self.tracer.event("compact_completed", turn_id=turn_id or None)
+
+    async def _handle_compaction_pressure(
+        self,
+        total_tokens: int,
+        context_window: int | None,
+    ) -> None:
+        action = self._compaction.observe_usage(total_tokens, context_window)
+        if action == "rearm":
+            logger.info(
+                "[%s] Compaction re-armed (%s/%s tokens)",
+                self.agent_name, total_tokens, context_window,
+            )
+        if action != "request":
+            return
+        logger.info(
+            f"[{self.agent_name}] Requesting compaction ({total_tokens}/{context_window} tokens)"
+        )
+        try:
+            if self._memory is not None:
+                self._memory.ensure()
+            self.tracer.event("compact_requested", tokens=total_tokens, window=context_window)
+            await self._rpc("thread/compact/start", {"threadId": self._thread_id})
+        except Exception as e:
+            logger.warning(f"[{self.agent_name}] Compaction request failed: {e}")
+            self._compaction.mark_failed()
 
     def _init_memory(self) -> None:
         workspace = getattr(self.sandbox, "workspace_dir", "") if self.sandbox else ""
