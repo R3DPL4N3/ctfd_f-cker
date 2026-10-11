@@ -14,6 +14,21 @@ logger = logging.getLogger(__name__)
 USER_AGENT = "Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36"
 
 
+def solved_names_from_stubs(stubs: list[dict[str, Any]]) -> set[str] | None:
+    """Return solved names when stubs expose `solved_by_me`.
+
+    None means the field is absent and callers should use another API.
+    An empty set means the field is present and nothing is solved.
+    """
+    if not stubs or not any("solved_by_me" in challenge for challenge in stubs):
+        return None
+    return {
+        challenge["name"]
+        for challenge in stubs
+        if challenge.get("name") and challenge.get("solved_by_me") is True
+    }
+
+
 @dataclass
 class SubmitResult:
     status: str  # "correct" | "already_solved" | "incorrect" | "unknown"
@@ -184,6 +199,22 @@ class CTFdClient:
         return detail
 
     async def fetch_solved_names(self) -> set[str]:
+        """Prefer `solved_by_me` on the challenge list.
+
+        Token auth often works on `/api/v1/challenges` while `/api/v1/users/me`
+        redirects. An empty set is legitimate when nothing is solved, so we only
+        use the list when the `solved_by_me` field is actually present.
+        """
+        try:
+            stubs = await self.fetch_challenge_stubs()
+            from_stubs = solved_names_from_stubs(stubs)
+            if from_stubs is not None:
+                return from_stubs
+        except Exception:
+            logger.warning("Could not derive solved challenges from challenge list", exc_info=True)
+        return await self._fetch_solved_names_from_profile()
+
+    async def _fetch_solved_names_from_profile(self) -> set[str]:
         try:
             me = await self._get("/users/me")
             user_data = me.get("data", {})

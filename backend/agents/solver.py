@@ -302,6 +302,7 @@ class Solver:
             list_distfiles(challenge_dir),
         )
         self.agent_name = f"{challenge_meta.name}/{self.model_id}"
+        self._step_count[0] = 0
         self.loop_detector.reset()
         self.tracer.event(
             "scenario_continued",

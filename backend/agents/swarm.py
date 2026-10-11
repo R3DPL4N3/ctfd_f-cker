@@ -158,6 +158,14 @@ class ChallengeSwarm:
         """Cooldown-gated flag submission through the control plane.
 
         Only an explicit CTFd rejection is cached. Transport and auth failures stay retryable.
+
+        Locking: this method holds `routing_lock` for the CTFd call and, on
+        ACCEPTED, the scenario refresh/continuation. That serializes unrelated
+        challenge submits while a flag is in flight.
+
+        TODO: split into a per-swarm `_flag_lock` around the CTFd attempt, then
+        take `routing_lock` only after ACCEPTED. Left as-is for the GOAD
+        benchmark — correctness over submit concurrency.
         """
         acquired = False
         try:
@@ -300,8 +308,11 @@ class ChallengeSwarm:
         return float(getattr(self.settings, "scenario_unlock_wait_seconds", 120))
 
     def _prepare_next_stage(self, meta: ChallengeMeta, challenge_dir: str) -> None:
+        """Reset current-stage runtime state. Scenario history stays in the session."""
         self.meta = meta
         self.challenge_dir = challenge_dir
+        self.winner = None
+        self._winner_spec = None
         self.confirmed_flag = None
         self._submitted_flags.clear()
         self._submit_count.clear()

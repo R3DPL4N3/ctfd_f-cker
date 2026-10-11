@@ -199,11 +199,13 @@ class ScenarioRegistry:
         cost_usd: float,
         findings: str = "",
         writeup_path: str = "",
+        step_count: int = 0,
     ) -> None:
         stages: list[dict[str, Any]] = session.metadata.setdefault("stage_costs", [])
         entry = {
             "challenge": challenge_name,
             "cost_usd": float(cost_usd),
+            "step_count": int(step_count),
             "findings": findings,
             "writeup": writeup_path,
         }
@@ -255,7 +257,13 @@ def format_scenario_cost(session: ScenarioSession) -> str:
     for stage in stages:
         cost = float(stage.get("cost_usd") or 0.0)
         total += cost
-        lines.extend([str(stage.get("challenge") or "?"), f"${cost:.2f}", ""])
+        steps = int(stage.get("step_count") or 0)
+        lines.extend([
+            str(stage.get("challenge") or "?"),
+            f"steps: {steps}",
+            f"${cost:.2f}",
+            "",
+        ])
     lines.extend(["Scenario total:", f"${total:.2f}"])
     return "\n".join(lines)
 

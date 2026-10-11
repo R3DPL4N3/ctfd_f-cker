@@ -307,3 +307,192 @@ def test_continuation_prompt_does_not_repeat_a_previous_flag() -> None:
     assert "AD-02" in prompt
     assert "/challenge/workspace/stages/ad-02/distfiles/loot.txt" in prompt
     assert "flag{" not in prompt
+
+
+def test_coordinator_llm_has_no_submit_flag_tool() -> None:
+    from backend.agents.codex_coordinator import COORDINATOR_TOOLS
+
+    assert "submit_flag" not in {tool["name"] for tool in COORDINATOR_TOOLS}
+
+
+@pytest.mark.asyncio
+async def test_coordinator_submit_without_swarm_does_not_call_ctfd() -> None:
+    from backend.agents.coordinator_core import do_submit_flag
+    from backend.deps import CoordinatorDeps
+
+    ctfd = _SubmitCTFd(SubmitResult("correct", "ok", 'CORRECT — "flag{ad1}" accepted.'))
+    deps = CoordinatorDeps(
+        ctfd=ctfd,
+        cost_tracker=CostTracker(),
+        settings=SimpleNamespace(scenario_unlock_wait_seconds=0.01),
+        model_specs=["codex/gpt-5.6-sol"],
+    )
+    display = await do_submit_flag(deps, "AD-01", "flag{ad1}")
+    assert display.startswith("REFUSED")
+    assert ctfd.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_coordinator_submit_routes_through_swarm_lifecycle() -> None:
+    from backend.agents.coordinator_core import _attach_scenario, do_submit_flag
+    from backend.deps import CoordinatorDeps
+
+    ctfd = _SubmitCTFd(SubmitResult("correct", "ok", 'CORRECT — "flag{ad1}" accepted.'))
+    swarm = _swarm(ctfd)
+    deps = CoordinatorDeps(
+        ctfd=ctfd,
+        cost_tracker=CostTracker(),
+        settings=swarm.settings,
+        model_specs=list(swarm.model_specs),
+    )
+    _attach_scenario(deps, swarm, swarm.meta)
+    deps.swarms["AD-01"] = swarm
+
+    display = await do_submit_flag(deps, "AD-01", "flag{ad1}")
+
+    assert display.startswith("CORRECT")
+    assert swarm.scenario_session is not None
+    assert swarm.scenario_session.state == "waiting_for_unlock"
+    assert swarm.scenario_session.solved_challenge_names == ["AD-01"]
+    assert ctfd.calls == 1
+
+
+def test_prepare_next_stage_clears_current_winner_not_history() -> None:
+    from backend.solver_base import FLAG_FOUND, SolverResult
+
+    registry = ScenarioRegistry()
+    swarm = _swarm(_SubmitCTFd(SubmitResult("incorrect", "", "INCORRECT")))
+    session = registry.create_session(
+        current_challenge_id=1,
+        current_challenge_name="AD-01",
+        category="Windows",
+    )
+    registry.record_stage(session, "AD-01", 0.22, "initial access", step_count=4)
+    swarm.scenario_session = session
+    swarm.winner = SolverResult(
+        flag="flag{ad1}",
+        status=FLAG_FOUND,
+        findings_summary="done",
+        step_count=4,
+        cost_usd=0.22,
+        log_path="",
+    )
+    swarm._winner_spec = "codex/gpt-5.6-sol"
+    swarm.confirmed_flag = "flag{ad1}"
+
+    swarm._prepare_next_stage(ChallengeMeta(name="AD-02", category="Windows", id=2), "/tmp/ad-02")
+
+    assert swarm.meta.name == "AD-02"
+    assert swarm.winner is None
+    assert swarm._winner_spec is None
+    assert swarm.confirmed_flag is None
+    assert swarm.get_status()["winner"] is None
+    assert session.metadata["stage_costs"][0]["challenge"] == "AD-01"
+    assert session.metadata["stage_costs"][0]["cost_usd"] == 0.22
+
+
+def test_solved_by_me_empty_set_is_legitimate() -> None:
+    from backend.ctfd import solved_names_from_stubs
+
+    stubs = [
+        {"name": "AD-01", "id": 1, "solved_by_me": False},
+        {"name": "WEB-01", "id": 9, "solved_by_me": False},
+    ]
+    assert solved_names_from_stubs(stubs) == set()
+    assert solved_names_from_stubs([{"name": "AD-01", "id": 1}]) is None
+    assert solved_names_from_stubs([]) is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_solved_names_uses_solved_by_me_when_users_me_fails() -> None:
+    from backend.ctfd import CTFdClient
+
+    class TokenCTFd(CTFdClient):
+        async def _get(self, path: str):
+            if path.startswith("/challenges/") or path.startswith("/users/me"):
+                raise RuntimeError("redirect to /login")
+            if path.startswith("/challenges"):
+                return {
+                    "success": True,
+                    "data": [
+                        {
+                            "name": "AD-01",
+                            "id": 1,
+                            "type": "standard",
+                            "solved_by_me": True,
+                        },
+                        {
+                            "name": "WEB-01",
+                            "id": 9,
+                            "type": "standard",
+                            "solved_by_me": False,
+                        },
+                    ],
+                }
+            raise AssertionError(path)
+
+    solved = await TokenCTFd().fetch_solved_names()
+    assert solved == {"AD-01"}
+
+
+@pytest.mark.asyncio
+async def test_fetch_solved_names_falls_back_when_solved_by_me_absent() -> None:
+    from backend.ctfd import CTFdClient
+
+    class ProfileCTFd(CTFdClient):
+        async def _get(self, path: str):
+            if path.startswith("/challenges"):
+                return {
+                    "success": True,
+                    "data": [{"name": "AD-01", "id": 1, "type": "standard"}],
+                }
+            if path.startswith("/users/me"):
+                return {"success": True, "data": {"id": 7, "team_id": None}}
+            if path.startswith("/users/7/solves"):
+                return {
+                    "success": True,
+                    "data": [{"challenge": {"name": "AD-01"}}],
+                }
+            raise AssertionError(path)
+
+    solved = await ProfileCTFd().fetch_solved_names()
+    assert solved == {"AD-01"}
+
+
+@pytest.mark.asyncio
+async def test_codex_continue_resets_stage_metrics_and_keeps_thread(tmp_path) -> None:
+    from backend.agents.codex_solver import CodexSolver
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    challenge = tmp_path / "ad-02"
+    challenge.mkdir()
+    (challenge / "metadata.yml").write_text("name: AD-02\ncategory: Windows\n", encoding="utf-8")
+
+    solver = CodexSolver(
+        model_spec="codex/gpt-5.6-sol",
+        challenge_dir=str(tmp_path / "ad-01"),
+        meta=ChallengeMeta(name="AD-01", category="Windows", id=1),
+        ctfd=object(),
+        cost_tracker=CostTracker(),
+        settings=SimpleNamespace(sandbox_image="ctf-sandbox", container_memory_limit="4g"),
+    )
+    solver._thread_id = "THREAD_A"
+    solver._proc = object()
+    solver.sandbox.workspace_dir = str(workspace)
+    solver._step_count = 17
+    solver._cost_usd = 0.22
+
+    await solver.continue_with_challenge(
+        ChallengeMeta(name="AD-02", category="Windows", description="north", id=2),
+        str(challenge),
+    )
+
+    assert solver._thread_id == "THREAD_A"
+    assert solver._proc is not None
+    assert solver._step_count == 0
+    assert solver._cost_usd == 0.0
+    assert solver.sandbox.workspace_dir == str(workspace)
+    assert solver.meta.name == "AD-02"
+    solver.tracer.close()
+
