@@ -97,7 +97,7 @@ A coordinator LLM manages the competition while solver swarms attack individual 
                                  |
                         +--------v--------+
                         | Coordinator LLM |
-                        |  Luna / Claude  |
+                        | Terra / Claude  |
                         +--------+--------+
                                  |
               +------------------+------------------+
@@ -249,7 +249,7 @@ uv run ctf-solve --coordinator claude ...
 The default Codex coordinator model is:
 
 ```text
-gpt-5.6-luna
+gpt-5.6-terra
 ```
 
 The default solver lineup currently contains:
@@ -280,7 +280,7 @@ Run only Windows challenges:
 uv run ctf-solve \
   --models codex/gpt-5.6-sol \
   --coordinator codex \
-  --coordinator-model gpt-5.6-luna \
+  --coordinator-model gpt-5.6-terra \
   --categories Windows \
   --max-challenges 1 \
   -v
