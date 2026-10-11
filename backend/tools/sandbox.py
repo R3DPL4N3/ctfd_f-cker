@@ -1,5 +1,7 @@
 """Pydantic AI tool wrappers — thin delegation to backend.tools.core."""
 
+from typing import Any
+
 from pydantic_ai import RunContext
 
 from backend.deps import SolverDeps
@@ -71,6 +73,48 @@ async def web_fetch(ctx: RunContext[SolverDeps], url: str, method: str = "GET", 
     Prefer bash+curl inside the sandbox for cookies/sessions.
     """
     return await do_web_fetch(url, method, body)
+
+
+async def memory_get(ctx: RunContext[SolverDeps]) -> str:
+    """Read persistent scenario memory (hosts, credentials, sessions, networks, findings)."""
+    store = ctx.deps.memory
+    if store is None:
+        return "Scenario memory is unavailable because the workspace is not mounted."
+    return store.structured_text()
+
+
+async def memory_update(
+    ctx: RunContext[SolverDeps],
+    targets: list[dict[str, Any]] | None = None,
+    credentials: list[dict[str, Any]] | None = None,
+    sessions: list[dict[str, Any]] | None = None,
+    networks: list[dict[str, Any]] | None = None,
+    findings: list[str] | None = None,
+    artifacts: list[str] | None = None,
+) -> str:
+    """Merge durable discoveries into scenario memory. Do not dump raw command output."""
+    store = ctx.deps.memory
+    if store is None:
+        return "Scenario memory is unavailable because the workspace is not mounted."
+    payload = {
+        key: value
+        for key, value in {
+            "targets": targets,
+            "credentials": credentials,
+            "sessions": sessions,
+            "networks": networks,
+            "findings": findings,
+            "artifacts": artifacts,
+        }.items()
+        if value
+    }
+    state = store.update(payload)
+    from backend.scenario_memory import render_markdown
+
+    return (
+        "Memory updated. Secrets are stored in scenario-state.json and are not echoed here.\n\n"
+        + render_markdown(state)
+    )
 
 
 async def webhook_create(ctx: RunContext[SolverDeps]) -> str:

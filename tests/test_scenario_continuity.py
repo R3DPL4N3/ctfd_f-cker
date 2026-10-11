@@ -17,6 +17,7 @@ from backend.prompts import ChallengeMeta, build_continuation_prompt
 from backend.sandbox import stage_challenge_into_workspace
 from backend.scenario import ScenarioRegistry
 from backend.scenario_router import (
+    causal_continuation_decision,
     decide_continuation,
     parse_prerequisite_ids,
     parse_route_decision,
@@ -495,4 +496,173 @@ async def test_codex_continue_resets_stage_metrics_and_keeps_thread(tmp_path) ->
     assert solver.sandbox.workspace_dir == str(workspace)
     assert solver.meta.name == "AD-02"
     solver.tracer.close()
+
+
+def test_causal_fallback_requires_single_waiting_unlock() -> None:
+    registry = ScenarioRegistry()
+    session = _waiting(registry, "AD-01", 1)
+    decision = causal_continuation_decision(
+        session,
+        new_challenge_count=1,
+        prerequisite_ids=[],
+        tags=[],
+    )
+    assert decision is not None
+    assert decision.action == "continue"
+    assert decision.session_id == session.id
+    assert decision.reason == "single challenge appeared in immediate post-solve refresh"
+
+
+def test_causal_fallback_does_not_override_explicit_prerequisite() -> None:
+    registry = ScenarioRegistry()
+    session = _waiting(registry, "AD-01", 1)
+    assert causal_continuation_decision(
+        session,
+        new_challenge_count=1,
+        prerequisite_ids=[1],
+        tags=[],
+    ) is None
+    explicit = decide_continuation(registry.get_active_sessions(), prerequisite_ids=[1])
+    assert explicit.action == "continue"
+    assert explicit.reason == "CTFd prerequisite matches the waiting scenario"
+
+
+def test_causal_fallback_does_not_override_explicit_tag() -> None:
+    registry = ScenarioRegistry()
+    session = _waiting(registry, "AD-01", 1, tags=["scenario:ad-chain"])
+    assert causal_continuation_decision(
+        session,
+        new_challenge_count=1,
+        prerequisite_ids=[],
+        tags=["scenario:ad-chain"],
+    ) is None
+    explicit = decide_continuation(
+        registry.get_active_sessions(),
+        prerequisite_ids=[],
+        tags=["scenario:ad-chain"],
+    )
+    assert explicit.action == "continue"
+    assert "scenario tag" in explicit.reason
+
+
+def test_causal_fallback_rejects_multiple_new_challenges() -> None:
+    registry = ScenarioRegistry()
+    session = _waiting(registry, "AD-01", 1)
+    assert causal_continuation_decision(
+        session,
+        new_challenge_count=2,
+        prerequisite_ids=[],
+        tags=[],
+    ) is None
+
+
+def test_causal_fallback_rejects_non_waiting_source() -> None:
+    registry = ScenarioRegistry()
+    session = registry.create_session(
+        current_challenge_id=1,
+        current_challenge_name="AD-01",
+        category="Windows",
+    )
+    session.state = "running"
+    assert causal_continuation_decision(
+        session,
+        new_challenge_count=1,
+        prerequisite_ids=[],
+        tags=[],
+    ) is None
+
+
+def test_unlock_wait_is_configurable() -> None:
+    swarm = _swarm(_SubmitCTFd(SubmitResult("incorrect", "", "INCORRECT")))
+    swarm.settings = SimpleNamespace(scenario_unlock_wait_seconds=7)
+    assert swarm._unlock_wait_seconds() == 7.0
+
+
+@pytest.mark.asyncio
+async def test_terminal_known_scenario_finishes_immediately() -> None:
+    from backend.agents.scenario_orchestrator import inspect_unlock_horizon, on_flag_accepted
+    from backend.deps import CoordinatorDeps
+    from backend.poller import CTFdPoller
+
+    class ClosedCTFd(_SubmitCTFd):
+        listing_includes_hidden = True
+
+        def __init__(self) -> None:
+            super().__init__(SubmitResult("correct", "ok", "CORRECT"))
+            self.challenges = [{
+                "id": 1,
+                "name": "AD-01",
+                "category": "Windows",
+                "tags": [],
+                "requirements": {"prerequisites": []},
+                "solved_by_me": True,
+            }]
+
+        async def fetch_challenge_stubs(self):
+            return list(self.challenges)
+
+        async def fetch_all_challenges(self):
+            return list(self.challenges)
+
+        async def fetch_solved_names(self):
+            return {"AD-01"}
+
+        async def get_challenge_id(self, name: str) -> int:
+            return 1
+
+    ctfd = ClosedCTFd()
+    swarm = _swarm(ctfd)
+    deps = CoordinatorDeps(
+        ctfd=ctfd,
+        cost_tracker=CostTracker(),
+        settings=swarm.settings,
+        model_specs=list(swarm.model_specs),
+    )
+    poller = CTFdPoller(ctfd=ctfd)
+    await poller._seed()
+    deps.poller = poller
+    from backend.agents.coordinator_core import _attach_scenario
+    _attach_scenario(deps, swarm, swarm.meta)
+    deps.swarms["AD-01"] = swarm
+    deps.scenario_registry.mark_challenge_solved(swarm.scenario_session, 1, "AD-01")
+    deps.scenario_registry.mark_waiting_for_unlock(swarm.scenario_session)
+
+    assert await inspect_unlock_horizon(deps, swarm.scenario_session) == "closed"
+    await on_flag_accepted(deps, swarm, "AD-01", "flag{ad1}")
+    assert swarm._continuation_decided is True
+
+
+@pytest.mark.asyncio
+async def test_unknown_hidden_unlock_does_not_finish_prematurely() -> None:
+    from backend.agents.scenario_orchestrator import inspect_unlock_horizon
+    from backend.deps import CoordinatorDeps
+
+    class PlayerCTFd(_SubmitCTFd):
+        listing_includes_hidden = False
+
+        def __init__(self) -> None:
+            super().__init__(SubmitResult("correct", "ok", "CORRECT"))
+
+        async def fetch_all_challenges(self):
+            return [{
+                "id": 1,
+                "name": "AD-01",
+                "tags": [],
+                "requirements": {"prerequisites": []},
+            }]
+
+    ctfd = PlayerCTFd()
+    swarm = _swarm(ctfd)
+    deps = CoordinatorDeps(
+        ctfd=ctfd,
+        cost_tracker=CostTracker(),
+        settings=swarm.settings,
+        model_specs=list(swarm.model_specs),
+    )
+    from backend.agents.coordinator_core import _attach_scenario
+    _attach_scenario(deps, swarm, swarm.meta)
+    deps.scenario_registry.mark_challenge_solved(swarm.scenario_session, 1, "AD-01")
+    deps.scenario_registry.mark_waiting_for_unlock(swarm.scenario_session)
+    assert await inspect_unlock_horizon(deps, swarm.scenario_session) == "unknown"
+    assert swarm._continuation_decided is False
 

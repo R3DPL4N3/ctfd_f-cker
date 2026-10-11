@@ -64,3 +64,13 @@ def test_openai_provider_omits_empty_base_url(monkeypatch) -> None:
     models.resolve_model("openai/gpt-test", settings)
 
     assert captured["provider_kwargs"] == {"api_key": "standard-key"}
+
+
+def test_glm_context_window_is_explicit() -> None:
+    assert models.context_window("glm-5.3") == 524_288
+    assert models.context_window("openai/glm-5.3") == 524_288
+    assert models.context_window("openai/GLM-5.3") == 524_288
+
+
+def test_unknown_model_keeps_default_context_window() -> None:
+    assert models.context_window("openai/totally-unknown-model") == 200_000

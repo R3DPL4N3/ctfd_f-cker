@@ -158,3 +158,34 @@ def decide_continuation(
         reason="no deterministic scenario relationship",
         deterministic=True,
     )
+
+
+def has_explicit_relationship(prerequisite_ids: list[int], tags: list[Any] | None = None) -> bool:
+    """True when CTFd prerequisites or scenario/chain tags can route the challenge."""
+    return bool(prerequisite_ids) or bool(scenario_tags(tags))
+
+
+def causal_continuation_decision(
+    session: ScenarioSession | None,
+    *,
+    new_challenge_count: int,
+    prerequisite_ids: list[int],
+    tags: list[Any] | None = None,
+) -> RouteDecision | None:
+    """Continue a waiting session when exactly one challenge appears after a solve.
+
+    Returns None when causal fallback must not override explicit routing.
+    """
+    if has_explicit_relationship(prerequisite_ids, tags):
+        return None
+    if new_challenge_count != 1:
+        return None
+    if session is None or session.state != "waiting_for_unlock":
+        return None
+    return RouteDecision(
+        action="continue",
+        session_id=session.id,
+        confidence=0.85,
+        reason="single challenge appeared in immediate post-solve refresh",
+        deterministic=True,
+    )

@@ -28,6 +28,7 @@ CONTEXT_WINDOWS: dict[str, int] = {
     "claude-opus-4-6": 1_000_000,
     "gpt-5.6-sol": 1_000_000,
     "gemini-3-flash-preview": 1_000_000,
+    "glm-5.3": 524_288,
 }
 
 # Models that support vision
@@ -158,4 +159,7 @@ def supports_vision(spec: str) -> bool:
 
 def context_window(spec: str) -> int:
     """Get context window size for a model spec."""
-    return CONTEXT_WINDOWS.get(model_id_from_spec(spec), 200_000)
+    model_id = model_id_from_spec(spec)
+    if model_id in CONTEXT_WINDOWS:
+        return CONTEXT_WINDOWS[model_id]
+    return CONTEXT_WINDOWS.get(model_id.lower(), 200_000)

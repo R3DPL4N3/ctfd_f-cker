@@ -315,6 +315,83 @@ async def test_memory_persists_across_codex_continuation(tmp_path) -> None:
     solver.tracer.close()
 
 
+@pytest.mark.asyncio
+async def test_generic_solver_memory_survives_continuation(tmp_path) -> None:
+    from backend.agents.solver import Solver
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    stage2 = tmp_path / "linux-102"
+    stage2.mkdir()
+    (stage2 / "metadata.yml").write_text("name: Linux 102\ncategory: Linux\n", encoding="utf-8")
+
+    solver = Solver(
+        model_spec="openai/glm-5.3",
+        challenge_dir=str(tmp_path / "linux-101"),
+        meta=ChallengeMeta(name="Linux 101", category="Linux", id=1),
+        ctfd=object(),
+        cost_tracker=CostTracker(),
+        settings=SimpleNamespace(sandbox_image="ctf-sandbox", container_memory_limit="4g"),
+    )
+    solver.sandbox.workspace_dir = str(workspace)
+    solver._init_memory()
+    solver.bind_scenario("scenario-1")
+    solver._memory.update({
+        "credentials": [{
+            "username": "svc_sql",
+            "domain": "corp.local",
+            "password": "s3cret",
+            "source": "Linux 101",
+        }],
+        "targets": [{"host": "10.10.10.5"}],
+    })
+    await solver.continue_with_challenge(
+        ChallengeMeta(name="Linux 102", category="Linux", id=2),
+        str(stage2),
+    )
+    state = solver._memory.load()
+    assert state.current_stage == "Linux 102"
+    assert state.completed_stages == ["Linux 101"]
+    assert state.credentials[0].password == "s3cret"
+    assert solver.sandbox.workspace_dir == str(workspace)
+    assert "PERSISTENT SCENARIO MEMORY" in solver._pending_prompt
+    solver.tracer.close()
+
+
+def test_unrelated_scenario_does_not_see_other_memory(tmp_path) -> None:
+    from backend.agents.solver import Solver
+
+    first = tmp_path / "one"
+    second = tmp_path / "two"
+    first.mkdir()
+    second.mkdir()
+    a = Solver(
+        model_spec="openai/glm-5.3",
+        challenge_dir=str(first),
+        meta=ChallengeMeta(name="Web 01"),
+        ctfd=object(),
+        cost_tracker=CostTracker(),
+        settings=SimpleNamespace(sandbox_image="ctf-sandbox", container_memory_limit="4g"),
+    )
+    b = Solver(
+        model_spec="openai/glm-5.3",
+        challenge_dir=str(second),
+        meta=ChallengeMeta(name="Pwn 01"),
+        ctfd=object(),
+        cost_tracker=CostTracker(),
+        settings=SimpleNamespace(sandbox_image="ctf-sandbox", container_memory_limit="4g"),
+    )
+    a.sandbox.workspace_dir = str(first)
+    b.sandbox.workspace_dir = str(second)
+    a._init_memory()
+    b._init_memory()
+    a._memory.update({"credentials": [{"username": "only-a", "password": "secret-a"}]})
+    assert b._memory.load().credentials == []
+    assert a._memory.load().credentials[0].username == "only-a"
+    a.tracer.close()
+    b.tracer.close()
+
+
 def test_compaction_controller_two_cycles_with_hysteresis() -> None:
     ctrl = CompactionController()
     window = 100_000
