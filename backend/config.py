@@ -15,6 +15,9 @@ class Settings(BaseSettings):
     # Optional API-backed providers. Codex defaults use the local CLI login instead.
     anthropic_api_key: str = ""
     openai_api_key: str = ""
+    # Optional override for any OpenAI-compatible API, e.g. https://host.example/v1.
+    # Leave empty to use the standard OpenAI endpoint.
+    openai_base_url: str = ""
     gemini_api_key: str = ""
 
     # Provider-specific settings, only needed for explicit Bedrock/Azure/Zen specs.
