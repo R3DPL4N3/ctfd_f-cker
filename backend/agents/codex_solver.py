@@ -90,7 +90,7 @@ class CompactionController:
 
 
 def _compact_window_eligible(context_window: int | None) -> bool:
-    return bool(context_window) and context_window < COMPACT_ELIGIBLE_WINDOW_MAX
+    return bool(context_window) and context_window <= COMPACT_ELIGIBLE_WINDOW_MAX
 
 
 def _below_compact_rearm(total_tokens: int, context_window: int | None) -> bool:
@@ -462,9 +462,9 @@ class CodexSolver:
                 total = token_usage.get("total", {})
 
                 context_window = token_usage.get("modelContextWindow")
-                total_tokens = total.get("totalTokens", 0)
+                context_tokens = last.get("totalTokens", 0)
                 self._compact_task = asyncio.create_task(
-                    self._handle_compaction_pressure(total_tokens, context_window)
+                    self._handle_compaction_pressure(context_tokens, context_window)
                 )
 
                 self.cost_tracker.record_tokens(
@@ -713,9 +713,7 @@ class CodexSolver:
         )
         logger.info(
             "[%s] Continuing on %s with thread %s",
-            self.agent_name,
-            challenge_meta.name,
-            self._thread_id,
+            self.agent_name, challenge_meta.name, self._thread_id,
         )
 
     @property
@@ -741,24 +739,24 @@ class CodexSolver:
 
     async def _handle_compaction_pressure(
         self,
-        total_tokens: int,
+        context_tokens: int,
         context_window: int | None,
     ) -> None:
-        action = self._compaction.observe_usage(total_tokens, context_window)
+        action = self._compaction.observe_usage(context_tokens, context_window)
         if action == "rearm":
             logger.info(
                 "[%s] Compaction re-armed (%s/%s tokens)",
-                self.agent_name, total_tokens, context_window,
+                self.agent_name, context_tokens, context_window,
             )
         if action != "request":
             return
         logger.info(
-            f"[{self.agent_name}] Requesting compaction ({total_tokens}/{context_window} tokens)"
+            f"[{self.agent_name}] Requesting compaction ({context_tokens}/{context_window} tokens)"
         )
         try:
             if self._memory is not None:
                 self._memory.ensure()
-            self.tracer.event("compact_requested", tokens=total_tokens, window=context_window)
+            self.tracer.event("compact_requested", tokens=context_tokens, window=context_window)
             await self._rpc("thread/compact/start", {"threadId": self._thread_id})
         except Exception as e:
             logger.warning(f"[{self.agent_name}] Compaction request failed: {e}")
