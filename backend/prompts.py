@@ -63,6 +63,7 @@ def build_continuation_prompt(
     meta: ChallengeMeta,
     container_path: str,
     distfile_names: list[str] | None = None,
+    memory_summary: str | None = None,
 ) -> str:
     """User turn for an already-open solver thread. Does not repeat the prior flag."""
     if distfile_names:
@@ -73,7 +74,7 @@ def build_continuation_prompt(
     connection = ""
     if meta.connection_info.strip():
         connection = f"Connection:\n{meta.connection_info.strip()}\n\n"
-    return (
+    body = (
         "The previous CTF objective was successfully solved and accepted.\n\n"
         "A newly unlocked related objective is now available.\n\n"
         f"Challenge:\n{meta.name}\n\n"
@@ -103,6 +104,15 @@ def build_continuation_prompt(
         "Solve the new objective and report the candidate flag with submit_flag.\n"
         "Do not repeat the previous flag.\n"
     )
+    if memory_summary and memory_summary.strip():
+        body += (
+            "\nPERSISTENT SCENARIO MEMORY\n\n"
+            f"{memory_summary.strip()}\n\n"
+            "The memory above is durable state from previous stages.\n"
+            "Use it instead of repeating completed reconnaissance.\n"
+            "Call memory_get for structured details including stored secrets.\n"
+        )
+    return body
 
 
 def list_distfiles(challenge_dir: str) -> list[str]:
@@ -126,6 +136,7 @@ def build_prompt(
     distfile_names: list[str],
     container_arch: str = "unknown",
     has_named_tools: bool = True,
+    include_memory: bool = False,
 ) -> str:
     """Build the system prompt.
 
@@ -243,5 +254,20 @@ def build_prompt(
         "6. Once CORRECT: output `FLAG: <value>` on its own line.",
         "7. Do not guess. Do not ask. Cover maximum surface area.",
     ]
+
+    if include_memory:
+        lines += [
+            "",
+            "## Persistent Scenario Memory",
+            "You have persistent scenario memory at `/challenge/workspace/scenario-state.json`",
+            "and `/challenge/workspace/scenario-memory.md`.",
+            "",
+            "Important discoveries that may matter in later stages MUST be recorded with `memory_update`.",
+            "Especially persist credentials, hashes, hosts, domains, internal networks, pivots,",
+            "active sessions, useful artifacts, and facts needed for lateral movement.",
+            "Do not store random low-value command output. Keep memory concise.",
+            "Do not rely only on conversation context because the thread may be compacted.",
+            "After compaction, call `memory_get` to recover durable state.",
+        ]
 
     return "\n".join(lines)

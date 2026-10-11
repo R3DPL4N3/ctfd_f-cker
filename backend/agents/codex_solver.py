@@ -118,6 +118,33 @@ SANDBOX_TOOLS = [
         "description": "Send a strategic message to the coordinator (e.g. flag format discovery, shared vulnerability, request for help).",
         "inputSchema": {"type": "object", "properties": {"message": {"type": "string"}}, "required": ["message"]},
     },
+    {
+        "name": "memory_get",
+        "description": (
+            "Read persistent scenario memory (hosts, credentials, sessions, networks, findings). "
+            "Use this after context compaction or when starting a new stage."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "memory_update",
+        "description": (
+            "Merge durable discoveries into scenario memory. "
+            "Record credentials, hosts, domains, networks, sessions, pivots, and later-stage findings. "
+            "Do not dump raw command output."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "targets": {"type": "array", "items": {"type": "object"}},
+                "credentials": {"type": "array", "items": {"type": "object"}},
+                "sessions": {"type": "array", "items": {"type": "object"}},
+                "networks": {"type": "array", "items": {"type": "object"}},
+                "findings": {"type": "array", "items": {"type": "string"}},
+                "artifacts": {"type": "array", "items": {"type": "string"}},
+            },
+        },
+    },
 ]
 
 
@@ -173,12 +200,15 @@ class CodexSolver:
         self._structured_output: dict | None = None
         self._turn_error: str | None = None
         self._compact_requested = False
+        self._compact_reminder = False
+        self._memory = None
         self._pending_responses: dict[int, asyncio.Future] = {}
         self._reader_task: asyncio.Task | None = None
         self._turn_done: asyncio.Event = asyncio.Event()
 
     async def start(self) -> None:
         await self.sandbox.start()
+        self._init_memory()
 
         arch_result = await self.sandbox.exec("uname -m", timeout_s=10)
         container_arch = arch_result.stdout.strip() or "unknown"
@@ -187,6 +217,7 @@ class CodexSolver:
         system_prompt = build_prompt(
             self.meta, distfile_names, container_arch=container_arch,
             has_named_tools=True,
+            include_memory=True,
         )
 
         self._proc = await asyncio.create_subprocess_exec(
@@ -353,15 +384,22 @@ class CodexSolver:
                 # Proactive compaction at 70% context window (only for small-context models like spark)
                 context_window = token_usage.get("modelContextWindow")
                 total_tokens = total.get("totalTokens", 0)
-                if context_window and context_window < 200_000 and total_tokens > context_window * 0.7:
-                    if not self._compact_requested:
-                        self._compact_requested = True
-                        logger.info(f"[{self.agent_name}] Requesting compaction ({total_tokens}/{context_window} tokens)")
-                        try:
-                            await self._rpc("thread/compact/start", {"threadId": self._thread_id})
-                            self.tracer.event("compact_requested", tokens=total_tokens, window=context_window)
-                        except Exception as e:
-                            logger.warning(f"[{self.agent_name}] Compaction request failed: {e}")
+                if (
+                    not self._compact_requested
+                    and context_window
+                    and context_window < 200_000
+                    and total_tokens > context_window * 0.7
+                ):
+                    self._compact_requested = True
+                    logger.info(f"[{self.agent_name}] Requesting compaction ({total_tokens}/{context_window} tokens)")
+                    try:
+                        if self._memory is not None:
+                            self._memory.ensure()
+                        self._compact_reminder = True
+                        await self._rpc("thread/compact/start", {"threadId": self._thread_id})
+                        self.tracer.event("compact_requested", tokens=total_tokens, window=context_window)
+                    except Exception as e:
+                        logger.warning(f"[{self.agent_name}] Compaction request failed: {e}")
 
                 self.cost_tracker.record_tokens(
                     self.agent_name, self.model_id,
@@ -390,9 +428,13 @@ class CodexSolver:
             args = {}
 
         self._step_count += 1
-        self.tracer.tool_call(tool_name, args, self._step_count)
+        traced_args = args
+        if tool_name == "memory_update":
+            from backend.scenario_memory import redact_memory_payload
+            traced_args = redact_memory_payload(args if isinstance(args, dict) else {})
+        self.tracer.tool_call(tool_name, traced_args, self._step_count)
 
-        loop_status = self.loop_detector.check(tool_name, args)
+        loop_status = self.loop_detector.check(tool_name, traced_args)
         if loop_status == "break":
             self.tracer.event("loop_break", tool=tool_name, step=self._step_count)
             result = "Loop detected — try a completely different approach."
@@ -410,7 +452,10 @@ class CodexSolver:
             self.tracer.tool_result(tool_name, f"image:{mime_type}:{len(image_bytes)}b", self._step_count)
         else:
             result_text = str(result)
-            self.tracer.tool_result(tool_name, result_text[:500], self._step_count)
+            traced_result = result_text[:500]
+            if tool_name in {"memory_get", "memory_update"}:
+                traced_result = "scenario memory updated" if tool_name == "memory_update" else "scenario memory read"
+            self.tracer.tool_result(tool_name, traced_result, self._step_count)
 
             if self._step_count % 5 == 0 and self.message_bus:
                 from backend.tools.core import do_check_findings
@@ -460,6 +505,10 @@ class CodexSolver:
                 await self.notify_coordinator(args.get("message", ""))
                 return "Message sent to coordinator."
             return "No coordinator connected."
+        elif name == "memory_get":
+            return self._memory_get()
+        elif name == "memory_update":
+            return self._memory_update(args)
         return f"Unknown tool: {name}"
 
     async def run_until_done_or_gave_up(self) -> SolverResult:
@@ -482,6 +531,15 @@ class CodexSolver:
             prompt_text = "Solve this CTF challenge."
         else:
             prompt_text = "Continue solving. Try a different approach."
+
+        if self._compact_reminder:
+            prompt_text = (
+                "Durable scenario state lives in /challenge/workspace/scenario-state.json "
+                "and /challenge/workspace/scenario-memory.md. "
+                "Call memory_get instead of reconstructing from conversation.\n\n"
+                + prompt_text
+            )
+            self._compact_reminder = False
 
         try:
             self._turn_done.clear()
@@ -507,12 +565,11 @@ class CodexSolver:
                     return self._result(QUOTA_ERROR)
                 return self._result(ERROR)
 
-            if self._structured_output:
-                if self._structured_output.get("type") == "flag_found":
-                    self._flag = self._structured_output.get("flag")
-                    self._findings = f"Flag found via {self._structured_output.get('method', '?')}: {self._flag}"
-                    if self.no_submit:
-                        self._confirmed = True
+            if self._structured_output and self._structured_output.get("type") == "flag_found":
+                self._flag = self._structured_output.get("flag")
+                self._findings = f"Flag found via {self._structured_output.get('method', '?')}: {self._flag}"
+                if self.no_submit:
+                    self._confirmed = True
 
             if self._confirmed and self._flag:
                 return self._result(FLAG_FOUND)
@@ -551,10 +608,20 @@ class CodexSolver:
         self._flag = None
         self._structured_output = None
         self._turn_error = None
+        memory_summary = None
+        if self._memory is not None:
+            self._memory.advance_stage(previous, challenge_meta.name)
+            memory_summary = self._memory.compact_markdown()
+        else:
+            self._init_memory()
+            if self._memory is not None:
+                self._memory.advance_stage(previous, challenge_meta.name)
+                memory_summary = self._memory.compact_markdown()
         self._pending_prompt = build_continuation_prompt(
             challenge_meta,
             container_path,
             list_distfiles(challenge_dir),
+            memory_summary=memory_summary,
         )
         self.agent_name = f"{challenge_meta.name}/{self.model_id}"
         self._cost_usd = 0.0
@@ -580,6 +647,51 @@ class CodexSolver:
             self.agent_name,
             challenge_meta.name,
             self._thread_id,
+        )
+
+    @property
+    def memory_path(self) -> str | None:
+        if self._memory is None:
+            return None
+        return str(self._memory.json_path)
+
+    def bind_scenario(self, scenario_id: str) -> None:
+        if self._memory is None:
+            self._init_memory()
+        if self._memory is not None:
+            self._memory.set_scenario_id(scenario_id)
+
+    def _init_memory(self) -> None:
+        workspace = getattr(self.sandbox, "workspace_dir", "") if self.sandbox else ""
+        if not workspace:
+            return
+        from backend.scenario_memory import ScenarioMemoryStore
+
+        self._memory = ScenarioMemoryStore(
+            workspace,
+            current_stage=self.meta.name,
+        )
+        self._memory.ensure()
+
+    def _memory_get(self) -> str:
+        if self._memory is None:
+            self._init_memory()
+        if self._memory is None:
+            return "Scenario memory is unavailable because the workspace is not mounted."
+        return self._memory.structured_text()
+
+    def _memory_update(self, args: dict) -> str:
+        if self._memory is None:
+            self._init_memory()
+        if self._memory is None:
+            return "Scenario memory is unavailable because the workspace is not mounted."
+        payload = args if isinstance(args, dict) else {}
+        state = self._memory.update(payload)
+        from backend.scenario_memory import render_markdown
+
+        return (
+            "Memory updated. Secrets are stored in scenario-state.json and are not echoed here.\n\n"
+            + render_markdown(state)
         )
 
     def bump(self, insights: str) -> None:

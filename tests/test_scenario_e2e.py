@@ -21,6 +21,7 @@ from backend.ctfd import SubmitResult, solved_names_from_stubs
 from backend.deps import CoordinatorDeps
 from backend.poller import CTFdPoller
 from backend.prompts import ChallengeMeta
+from backend.scenario_memory import ScenarioMemoryStore
 from backend.solver_base import FLAG_FOUND, GAVE_UP, SolverResult
 
 FLAGS = {
@@ -79,6 +80,7 @@ class FakeContinuingSolver:
         self._cost_usd = 0.0
         self._confirmed = False
         self._flag = None
+        self._memory = None
         self.tracer = SimpleNamespace(path="", event=lambda *_a, **_k: None, close=lambda: None)
 
     async def start(self) -> None:
@@ -86,6 +88,22 @@ class FakeContinuingSolver:
         Path(self.sandbox.workspace_dir, "persistence-test.txt").write_text(
             "keep-me", encoding="utf-8"
         )
+        self._memory = ScenarioMemoryStore(
+            self.sandbox.workspace_dir,
+            current_stage=self.meta.name,
+        )
+        self._memory.ensure()
+        self._memory.update({
+            "targets": [{"host": "10.10.10.5", "hostname": "server01"}],
+            "credentials": [{
+                "username": "svc_sql",
+                "domain": "corp.local",
+                "password": "s3cret",
+                "source": "AD-01",
+            }],
+            "networks": [{"cidr": "10.20.0.0/24"}],
+            "findings": ["svc_sql appears reusable on internal hosts"],
+        })
 
     async def run_until_done_or_gave_up(self) -> SolverResult:
         steps, cost = STAGE_METRICS[self.meta.name]
@@ -116,6 +134,8 @@ class FakeContinuingSolver:
     async def continue_with_challenge(self, challenge_meta: ChallengeMeta, challenge_dir: str) -> None:
         sentinel = Path(self.sandbox.workspace_dir) / "persistence-test.txt"
         assert sentinel.read_text(encoding="utf-8") == "keep-me"
+        if getattr(self, "_memory", None) is not None:
+            self._memory.advance_stage(self.meta.name, challenge_meta.name)
         self.continue_calls.append((self.meta.name, challenge_meta.name))
         self.meta = challenge_meta
         self.challenge_dir = challenge_dir
@@ -127,6 +147,16 @@ class FakeContinuingSolver:
 
     def bump(self, insights: str) -> None:
         del insights
+
+    def bind_scenario(self, scenario_id: str) -> None:
+        if self._memory is not None:
+            self._memory.set_scenario_id(scenario_id)
+
+    @property
+    def memory_path(self) -> str | None:
+        if self._memory is None:
+            return None
+        return str(self._memory.json_path)
 
     async def stop(self) -> None:
         self.stop_calls += 1
@@ -305,10 +335,20 @@ async def test_three_stage_chain_reuses_solver_thread_and_sandbox(tmp_path, monk
     assert sandbox.workspace_dir == str(workspace)
     assert sandbox.stopped is True
     assert (workspace / "persistence-test.txt").read_text(encoding="utf-8") == "keep-me"
+    memory = ScenarioMemoryStore(workspace).load()
+    markdown = (workspace / "scenario-memory.md").read_text(encoding="utf-8")
+    assert memory.current_stage == "AD-03"
+    assert memory.completed_stages == ["AD-01", "AD-02"]
+    assert memory.credentials[0].username == "svc_sql"
+    assert memory.credentials[0].password == "s3cret"
+    assert memory.targets[0].host == "10.10.10.5"
+    assert "s3cret" not in markdown
+    assert "password available" in markdown
 
     session = next(iter(deps.scenario_registry._sessions.values()))
     assert session.state == "stopped"
     assert session.solver is solver
+    assert session.metadata.get("memory_path") == str(workspace / "scenario-state.json")
     assert session.solved_challenge_names == ["AD-01", "AD-02", "AD-03"]
     stages = {row["challenge"]: row for row in session.metadata["stage_costs"]}
     assert stages["AD-01"]["cost_usd"] == 0.22

@@ -181,6 +181,28 @@ If the winning solver does not support `continue_with_challenge()`, the system f
 
 Direct CTFd prerequisite relationships are deterministic and do not require the coordinator LLM to guess whether two challenges belong to the same scenario.
 
+## Persistent Scenario Memory
+
+Multi-stage Codex solvers keep a small durable notebook inside the existing sandbox workspace. It is independent of the LLM conversation, so it still exists after Codex context compaction.
+
+Files:
+
+```text
+/challenge/workspace/scenario-state.json
+/challenge/workspace/scenario-memory.md
+```
+
+`scenario-state.json` is the canonical structured state (hosts, credentials, sessions, networks, findings, artifacts). `scenario-memory.md` is a compact projection of that state. The Markdown file records that a password or hash is available; it does not print the secret. The solver reads structured details with `memory_get`.
+
+Codex tools:
+
+- `memory_update` — merge discoveries into the workspace files
+- `memory_get` — read the current structured memory
+
+Continuation keeps the same Codex thread, the same Docker sandbox, and the same workspace, so Linux 101 → Linux 102 → Linux 103 (or AD-01 → AD-02 → AD-03) reuse one memory file for as long as that scenario sandbox lives. When the scenario ends, normal workspace cleanup may remove it.
+
+The coordinator never receives these secrets. Memory is not a vector database and does not leave the isolated workspace.
+
 ## Flag Submission Control Plane
 
 Solvers do not independently own CTFd submission state.

@@ -218,6 +218,7 @@ class ChallengeSwarm:
                 solver = self.solvers.get(model_spec)
                 if self.scenario_session is not None and solver is not None:
                     self.scenario_session.solver = solver
+                    self._bind_solver_memory(solver)
                     try:
                         self.scenario_session.sandbox_id = solver.sandbox.container_id
                     except Exception:
@@ -307,6 +308,17 @@ class ChallengeSwarm:
     def _unlock_wait_seconds(self) -> float:
         return float(getattr(self.settings, "scenario_unlock_wait_seconds", 120))
 
+    def _bind_solver_memory(self, solver: Any) -> None:
+        session = self.scenario_session
+        if session is None:
+            return
+        bind = getattr(solver, "bind_scenario", None)
+        if callable(bind):
+            bind(session.id)
+        path = getattr(solver, "memory_path", None)
+        if path:
+            session.metadata["memory_path"] = path
+
     def _prepare_next_stage(self, meta: ChallengeMeta, challenge_dir: str) -> None:
         """Reset current-stage runtime state. Scenario history stays in the session."""
         self.meta = meta
@@ -370,6 +382,7 @@ class ChallengeSwarm:
             step_count=0, cost_usd=0.0, log_path="",
         )
         await solver.start()
+        self._bind_solver_memory(solver)
 
         while not self.cancel_event.is_set():
             result = await solver.run_until_done_or_gave_up()
