@@ -10,6 +10,7 @@ from pathlib import Path
 import click
 from rich.console import Console
 
+from backend.category_filter import normalize_categories
 from backend.config import Settings
 from backend.models import DEFAULT_MODELS
 
@@ -39,6 +40,8 @@ def _setup_logging(verbose: bool = False) -> None:
 @click.option("--coordinator-model", default=None, help="Model for coordinator (default: gpt-5.6-luna)")
 @click.option("--coordinator", default="codex", type=click.Choice(["claude", "codex"]), help="Coordinator backend")
 @click.option("--max-challenges", default=10, type=int, help="Max challenges solved concurrently")
+@click.option("--category", "categories", multiple=True, help="Allowed CTFd category (repeatable)")
+@click.option("--categories", "categories_csv", default="", help="Comma-separated CTFd category whitelist")
 @click.option("--msg-port", default=0, type=int, help="Operator message port (0 = auto)")
 @click.option("-v", "--verbose", is_flag=True, help="Verbose logging")
 def main(
@@ -52,6 +55,8 @@ def main(
     coordinator_model: str | None,
     coordinator: str,
     max_challenges: int,
+    categories: tuple[str, ...],
+    categories_csv: str,
     msg_port: int,
     verbose: bool,
 ) -> None:
@@ -68,6 +73,9 @@ def main(
         settings.ctfd_token = ctfd_token
     settings.max_concurrent_challenges = max_challenges
 
+    csv_categories = [part for part in categories_csv.split(",") if part.strip()]
+    settings.allowed_categories = normalize_categories([*categories, *csv_categories])
+
     model_specs = list(models) if models else list(DEFAULT_MODELS)
 
     console.print("[bold]CTF Agent v2[/bold]")
@@ -75,6 +83,10 @@ def main(
     console.print(f"  Models: {', '.join(model_specs)}")
     console.print(f"  Image: {settings.sandbox_image}")
     console.print(f"  Max challenges: {max_challenges}")
+    console.print(
+        "  Categories: "
+        + (", ".join(settings.allowed_categories) if settings.allowed_categories else "ALL")
+    )
     console.print()
 
     if challenge:

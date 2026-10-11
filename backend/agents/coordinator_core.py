@@ -8,6 +8,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from backend.category_filter import category_allowed
 from backend.deps import CoordinatorDeps
 from backend.prompts import ChallengeMeta
 from backend.solver_base import FLAG_FOUND
@@ -52,13 +53,20 @@ async def ensure_challenge_materials(deps: CoordinatorDeps, challenge_name: str)
         challenges = await deps.ctfd.fetch_all_challenges()
         challenge_data = next((c for c in challenges if c.get("name") == challenge_name), None)
         if not challenge_data:
-            raise RuntimeError(f"Challenge '{challenge_name}' not found on CTFd")
+            allowed = getattr(deps.settings, "allowed_categories", [])
+            suffix = f" (allowed categories: {', '.join(allowed)})" if allowed else ""
+            raise RuntimeError(f"Challenge '{challenge_name}' not found or is filtered out{suffix}")
         output_dir = str(Path(deps.challenges_root))
         challenge_dir = await deps.ctfd.pull_challenge(challenge_data, output_dir)
         deps.challenge_dirs[challenge_name] = challenge_dir
         deps.challenge_metas[challenge_name] = ChallengeMeta.from_yaml(Path(challenge_dir) / "metadata.yml")
 
     meta = deps.challenge_metas[challenge_name]
+    allowed = getattr(deps.settings, "allowed_categories", [])
+    if not category_allowed(allowed, meta.category):
+        raise RuntimeError(
+            f"Challenge '{challenge_name}' category '{meta.category}' is blocked by the category whitelist"
+        )
     if meta.id is None:
         try:
             meta.id = await deps.ctfd.get_challenge_id(challenge_name)
@@ -255,7 +263,7 @@ async def do_read_solver_trace(deps: CoordinatorDeps, challenge_name: str, model
 
 
 async def do_broadcast(deps: CoordinatorDeps, challenge_name: str, message: str) -> str:
-    """Broadcast a message to all solvers working on a challenge."""
+    """Broadcast a strategic hint to all solvers on a challenge."""
     swarm = deps.swarms.get(challenge_name)
     if not swarm:
         return f"No swarm running for {challenge_name}"

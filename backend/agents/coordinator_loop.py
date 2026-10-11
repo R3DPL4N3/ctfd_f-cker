@@ -14,6 +14,7 @@ from backend.config import Settings
 from backend.cost_tracker import CostTracker
 from backend.ctfd import CTFdClient
 from backend.deps import CoordinatorDeps
+from backend.filtered_ctfd import FilteredCTFdClient
 from backend.models import DEFAULT_MODELS
 from backend.poller import CTFdPoller
 from backend.prompts import ChallengeMeta
@@ -33,11 +34,12 @@ def build_deps(
     challenge_metas: dict[str, ChallengeMeta] | None = None,
 ) -> tuple[CTFdClient, CostTracker, CoordinatorDeps]:
     """Create CTFd client, cost tracker, and coordinator deps."""
-    ctfd = CTFdClient(
+    ctfd = FilteredCTFdClient(
         base_url=settings.ctfd_url,
         token=settings.ctfd_token,
         username=settings.ctfd_user,
         password=settings.ctfd_pass,
+        allowed_categories=getattr(settings, "allowed_categories", []),
     )
     cost_tracker = CostTracker()
     specs = model_specs or list(DEFAULT_MODELS)
@@ -99,8 +101,9 @@ async def run_event_loop(
 
     unsolved = poller.known_challenges - poller.known_solved
     initial_msg = (
-        f"CTF is LIVE. {len(poller.known_challenges)} challenges, "
+        f"CTF is LIVE. {len(poller.known_challenges)} eligible challenges, "
         f"{len(poller.known_solved)} solved.\n"
+        f"Allowed categories: {getattr(deps.settings, 'allowed_categories', []) or 'ALL'}\n"
         f"Unsolved: {sorted(unsolved) if unsolved else 'NONE'}\n"
         "Fetch challenges and spawn swarms for all unsolved."
     )
