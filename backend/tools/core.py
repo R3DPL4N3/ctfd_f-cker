@@ -74,17 +74,14 @@ async def do_list_files(sandbox, path: str = "/challenge/distfiles") -> str:
 
 
 async def do_submit_flag(ctfd, challenge_name: str, flag: str) -> tuple[str, bool]:
-    """Submit a flag. Returns (display_message, is_confirmed)."""
-    flag = flag.strip()
-    if not flag:
-        return "Empty flag — nothing to submit.", False
+    """Submit a flag via the control plane. Returns (display_message, is_confirmed).
 
-    try:
-        result = await ctfd.submit_flag(challenge_name, flag)
-        is_confirmed = result.status in ("correct", "already_solved")
-        return result.display, is_confirmed
-    except Exception as e:
-        return f"submit_flag error: {e}", False
+    Retryable failures return is_confirmed=False and do not mean the flag was rejected.
+    """
+    from backend.flag_submit import submit_flag_candidate
+
+    submission = await submit_flag_candidate(ctfd, challenge_name, flag)
+    return submission.display, submission.accepted
 
 
 def _is_internal_url(url: str) -> bool:

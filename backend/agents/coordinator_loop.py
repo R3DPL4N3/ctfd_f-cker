@@ -9,6 +9,7 @@ from collections.abc import Callable, Coroutine
 from pathlib import Path
 from typing import Any
 
+from backend.agents.scenario_orchestrator import handle_new_challenge
 from backend.config import Settings
 from backend.cost_tracker import CostTracker
 from backend.ctfd import CTFdClient
@@ -83,6 +84,7 @@ async def run_event_loop(
         status_interval: Seconds between status updates.
     """
     poller = CTFdPoller(ctfd=ctfd, interval_s=5.0)
+    deps.poller = poller
     await poller.start()
 
     # Start operator message HTTP endpoint
@@ -118,22 +120,48 @@ async def run_event_loop(
                 events.append(evt)
             events.extend(poller.drain_events())
 
-            # Auto-kill swarms for solved challenges
+            # Solved scenario swarms stay up until continuation or the unlock timeout.
             for evt in events:
                 if evt.kind == "challenge_solved" and evt.challenge_name in deps.swarms:
                     swarm = deps.swarms[evt.challenge_name]
-                    if not swarm.cancel_event.is_set():
+                    if getattr(swarm, "scenario_mode", False):
+                        logger.info("Scenario swarm stays up after solve: %s", evt.challenge_name)
+                    elif not swarm.cancel_event.is_set():
                         swarm.kill()
                         logger.info("Auto-killed swarm for: %s", evt.challenge_name)
 
             parts: list[str] = []
             for evt in events:
                 if evt.kind == "new_challenge":
-                    parts.append(f"NEW CHALLENGE: '{evt.challenge_name}' appeared. Spawn a swarm.")
-                    # Auto-spawn for new challenges
-                    await _auto_spawn_one(deps, evt.challenge_name)
+                    # Continuation routing runs before a new sandbox can be created.
+                    outcome = await handle_new_challenge(
+                        deps,
+                        evt.challenge_name,
+                        evt.details,
+                        unlocked=True,
+                    )
+                    if outcome == "continued":
+                        parts.append(
+                            f"CONTINUED SCENARIO: '{evt.challenge_name}' reused the existing solver."
+                        )
+                    elif outcome == "spawned":
+                        parts.append(f"NEW CHALLENGE: '{evt.challenge_name}' — independent swarm spawned.")
+                    elif outcome == "failed":
+                        parts.append(f"NEW CHALLENGE: '{evt.challenge_name}' — spawn failed.")
                 elif evt.kind == "challenge_solved":
-                    parts.append(f"SOLVED: '{evt.challenge_name}' — swarm auto-killed.")
+                    swarm = deps.swarms.get(evt.challenge_name)
+                    session = deps.scenario_registry.find_session_by_challenge(
+                        challenge_name=evt.challenge_name
+                    )
+                    kept = (swarm is not None and getattr(swarm, "scenario_mode", False)) or (
+                        session is not None and session.state != "stopped"
+                    )
+                    if kept:
+                        parts.append(
+                            f"SOLVED: '{evt.challenge_name}' — solver is waiting for a related unlock."
+                        )
+                    else:
+                        parts.append(f"SOLVED: '{evt.challenge_name}' — swarm auto-killed.")
 
             # Detect finished swarms
             for name, task in list(deps.swarm_tasks.items()):
@@ -203,31 +231,25 @@ async def run_event_loop(
 
     return {
         "results": deps.results,
+        "scenarios": deps.scenario_registry.cost_summaries(),
         "total_cost_usd": cost_tracker.total_cost_usd,
         "total_tokens": cost_tracker.total_tokens,
     }
 
 
-async def _auto_spawn_one(deps: CoordinatorDeps, challenge_name: str) -> None:
-    """Auto-spawn a swarm for a single challenge if not already running."""
-    if challenge_name in deps.swarms:
-        return
-    active = sum(1 for t in deps.swarm_tasks.values() if not t.done())
-    if active >= deps.max_concurrent_challenges:
-        return
-    try:
-        from backend.agents.coordinator_core import do_spawn_swarm
-        result = await do_spawn_swarm(deps, challenge_name)
-        logger.info(f"Auto-spawn {challenge_name}: {result[:100]}")
-    except Exception as e:
-        logger.warning(f"Auto-spawn failed for {challenge_name}: {e}")
-
-
 async def _auto_spawn_unsolved(deps: CoordinatorDeps, poller) -> None:
-    """Auto-spawn swarms for all unsolved challenges that don't have active swarms."""
+    """Spawn independent swarms for challenges that are not scenario continuations."""
     unsolved = poller.known_challenges - poller.known_solved
     for name in sorted(unsolved):
-        await _auto_spawn_one(deps, name)
+        try:
+            await handle_new_challenge(
+                deps,
+                name,
+                {"id": poller.challenge_id(name)},
+                unlocked=False,
+            )
+        except Exception as exc:
+            logger.warning("Auto-spawn failed for %s: %s", name, exc)
 
 
 async def _start_msg_server(inbox: asyncio.Queue, port: int = 0) -> asyncio.Server | None:

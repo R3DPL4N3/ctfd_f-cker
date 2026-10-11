@@ -9,6 +9,7 @@ logs/
 
 # Challenge data (downloaded at runtime)
 challenges*/
+scenario-writeups/
 
 # Python
 __pycache__/

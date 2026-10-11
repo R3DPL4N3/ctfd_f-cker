@@ -28,7 +28,14 @@ from backend.models import (
 from backend.output_types import FlagFound
 from backend.prompts import ChallengeMeta, build_prompt, list_distfiles
 from backend.sandbox import DockerSandbox
-from backend.solver_base import CANCELLED, CORRECT_MARKERS, ERROR, FLAG_FOUND, GAVE_UP, SolverResult
+from backend.solver_base import (
+    CANCELLED,
+    ERROR,
+    FLAG_FOUND,
+    GAVE_UP,
+    SolverResult,
+    submission_accepted,
+)
 from backend.tools.flag import submit_flag
 from backend.tools.sandbox import (
     bash,
@@ -81,7 +88,7 @@ class TracingToolset(WrapperToolset[SolverDeps]):
             result = f"{result}\n\n{LOOP_WARNING_MESSAGE}" if isinstance(result, str) else result
 
         # Check for confirmed flag
-        if name == "submit_flag" and any(m in result_str for m in CORRECT_MARKERS):
+        if name == "submit_flag" and submission_accepted(result_str):
             self.tracer.event("flag_confirmed", tool=name, step=step)
 
         if step % 5 == 0 and ctx.deps.message_bus and isinstance(result, str):
@@ -152,6 +159,7 @@ class Solver:
         self._flag: str | None = None
         self._confirmed: bool = False
         self._findings: str = ""
+        self._pending_prompt: str | None = None
 
     async def start(self) -> None:
         """Start the sandbox and build the agent."""
@@ -198,12 +206,18 @@ class Solver:
         assert self._agent is not None
 
         t0 = time.monotonic()
-        steps_before = self._step_count[0]
 
         try:
             from pydantic_ai.usage import UsageLimits
+            if self._pending_prompt:
+                prompt = self._pending_prompt
+                self._pending_prompt = None
+            elif not self._messages:
+                prompt = "Solve this CTF challenge."
+            else:
+                prompt = "Continue solving."
             result = await self._agent.run(
-                "Solve this CTF challenge." if not self._messages else "Continue solving.",
+                prompt,
                 deps=self.deps,
                 message_history=self._messages if self._messages else None,
                 usage_limits=UsageLimits(request_limit=None),
@@ -263,6 +277,39 @@ class Solver:
             self._findings = f"Error: {e}"
             self.tracer.event("error", error=str(e))
             return self._result(ERROR)
+
+    async def continue_with_challenge(self, challenge_meta: ChallengeMeta, challenge_dir: str) -> None:
+        """Keep this agent, its message history, and its sandbox. Do not start a new container."""
+        from backend.prompts import build_continuation_prompt, list_distfiles
+        from backend.sandbox import stage_challenge_into_workspace
+
+        container_path = stage_challenge_into_workspace(
+            self.sandbox.workspace_dir,
+            challenge_dir,
+            challenge_meta.name,
+        )
+        previous = self.meta.name
+        self.challenge_dir = challenge_dir
+        self.meta = challenge_meta
+        self.deps.challenge_dir = challenge_dir
+        self.deps.challenge_name = challenge_meta.name
+        self.deps.confirmed_flag = None
+        self._confirmed = False
+        self._flag = None
+        self._pending_prompt = build_continuation_prompt(
+            challenge_meta,
+            container_path,
+            list_distfiles(challenge_dir),
+        )
+        self.agent_name = f"{challenge_meta.name}/{self.model_id}"
+        self.loop_detector.reset()
+        self.tracer.event(
+            "scenario_continued",
+            from_challenge=previous,
+            to_challenge=challenge_meta.name,
+            sandbox_reused=True,
+        )
+        logger.info("[%s] Continuing on %s in the existing sandbox", self.agent_name, challenge_meta.name)
 
     def bump(self, insights: str) -> None:
         """Inject insights from siblings and prepare to resume."""

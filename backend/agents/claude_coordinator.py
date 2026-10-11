@@ -49,6 +49,10 @@ CRITICAL RULES:
 - When a solver seems stuck, bump it with very specific technical guidance based on
   its trace. Tell it exactly what to try next — specific tools, techniques, approaches.
 - Cost is not a concern. Keep all swarms running.
+- Scenario continuation is owned by the control plane. If a message says a scenario
+  continued, do not spawn a second swarm for that challenge.
+- Give strategic hints to stuck solvers. Do not run scans, exploits, shells, or
+  other challenge operations yourself.
 
 You will receive event messages. Respond with tool calls to manage the competition.
 """

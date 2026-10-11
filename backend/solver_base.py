@@ -12,8 +12,17 @@ CANCELLED = "cancelled"
 ERROR = "error"
 QUOTA_ERROR = "quota_error"
 
-# Flag confirmation markers from CTFd
+# Flag confirmation markers from CTFd. "INCORRECT" contains "CORRECT", so callers
+# must use submission_accepted() instead of a raw substring test.
 CORRECT_MARKERS = ("CORRECT", "ALREADY SOLVED")
+
+
+def submission_accepted(display: str) -> bool:
+    """True only when the control plane reported an explicit accept."""
+    text = display.strip().upper()
+    if text.startswith(("INCORRECT", "RETRYABLE_ERROR", "FATAL_ERROR", "COOLDOWN", "DRY RUN")):
+        return False
+    return text.startswith("CORRECT") or text.startswith("ALREADY SOLVED")
 
 
 @dataclass

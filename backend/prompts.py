@@ -22,6 +22,8 @@ class ChallengeMeta:
     connection_info: str = ""
     hints: list[dict[str, Any]] = field(default_factory=list)
     solves: int = 0
+    id: int | None = None
+    requirements: list[int] = field(default_factory=list)
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> ChallengeMeta:
@@ -36,7 +38,71 @@ class ChallengeMeta:
             connection_info=data.get("connection_info", ""),
             hints=data.get("hints", []),
             solves=data.get("solves", 0),
+            id=data.get("id"),
+            requirements=_coerce_requirements(data.get("requirements")),
         )
+
+
+def _coerce_requirements(value: Any) -> list[int]:
+    if isinstance(value, dict):
+        value = value.get("prerequisites") or []
+    if not isinstance(value, list):
+        return []
+    requirements: list[int] = []
+    for item in value:
+        if isinstance(item, dict):
+            item = item.get("id")
+        try:
+            requirements.append(int(item))
+        except (TypeError, ValueError):
+            continue
+    return requirements
+
+
+def build_continuation_prompt(
+    meta: ChallengeMeta,
+    container_path: str,
+    distfile_names: list[str] | None = None,
+) -> str:
+    """User turn for an already-open solver thread. Does not repeat the prior flag."""
+    if distfile_names:
+        listing = "\n".join(f"- {container_path}/distfiles/{name}" for name in distfile_names)
+        files = f"New files:\n{listing}\n"
+    else:
+        files = "No new distfiles were attached. Continue from your existing access.\n"
+    connection = ""
+    if meta.connection_info.strip():
+        connection = f"Connection:\n{meta.connection_info.strip()}\n\n"
+    return (
+        "The previous CTF objective was successfully solved and accepted.\n\n"
+        "A newly unlocked related objective is now available.\n\n"
+        f"Challenge:\n{meta.name}\n\n"
+        f"Category:\n{meta.category or 'Unknown'}\n\n"
+        f"Description:\n{meta.description or '_No description provided._'}\n\n"
+        f"{connection}"
+        f"{files}\n"
+        "Previous distfiles remain mounted at /challenge/distfiles.\n"
+        f"Files for this objective are under {container_path}.\n"
+        "Workspace files under /challenge/workspace/ are unchanged.\n\n"
+        "Continue from your CURRENT position.\n\n"
+        "Preserve and reuse all existing:\n"
+        "- access\n"
+        "- credentials\n"
+        "- sessions\n"
+        "- Kerberos tickets\n"
+        "- shells\n"
+        "- pivots\n"
+        "- tunnels\n"
+        "- reconnaissance\n"
+        "- workspace files\n"
+        "- discovered hosts\n"
+        "- previous findings\n\n"
+        "Do not restart the assessment from the original target unless technically necessary.\n\n"
+        "The original system instructions describe the previous objective. "
+        "This message supersedes that objective.\n\n"
+        "Solve the new objective and report the candidate flag with submit_flag.\n"
+        "Do not repeat the previous flag.\n"
+    )
 
 
 def list_distfiles(challenge_dir: str) -> list[str]:

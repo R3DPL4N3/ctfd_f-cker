@@ -47,7 +47,7 @@ _rpc_counter = itertools.count(1)
 
 # Per-model reasoning effort (only for models that support it)
 REASONING_EFFORT: dict[str, str] = {
-    "gpt-5.6-sol": "max",
+    "gpt-5.6-sol": "high",
 }
 
 
@@ -86,7 +86,11 @@ SANDBOX_TOOLS = [
     },
     {
         "name": "submit_flag",
-        "description": "Submit a flag to CTFd. Returns CORRECT, ALREADY SOLVED, or INCORRECT.",
+        "description": (
+            "Report a candidate flag to the control plane. "
+            "Returns CORRECT, ALREADY SOLVED, INCORRECT, RETRYABLE_ERROR, or FATAL_ERROR. "
+            "RETRYABLE_ERROR means the flag was not judged; submit it again."
+        ),
         "inputSchema": {"type": "object", "properties": {"flag": {"type": "string"}}, "required": ["flag"]},
     },
     {
@@ -165,6 +169,7 @@ class CodexSolver:
         self._findings = ""
         self._cost_usd = 0.0
         self._bump_insights: str | None = None
+        self._pending_prompt: str | None = None
         self._structured_output: dict | None = None
         self._turn_error: str | None = None
         self._compact_requested = False
@@ -463,7 +468,10 @@ class CodexSolver:
         assert self._thread_id
 
         t0 = time.monotonic()
-        if self._bump_insights:
+        if self._pending_prompt:
+            prompt_text = self._pending_prompt
+            self._pending_prompt = None
+        elif self._bump_insights:
             prompt_text = (
                 "Your previous attempt did not find the flag. "
                 f"Insights from other agents:\n\n{self._bump_insights}\n\n"
@@ -520,6 +528,58 @@ class CodexSolver:
             if "quota" in error_str.lower() or "rate" in error_str.lower():
                 return self._result(QUOTA_ERROR)
             return self._result(ERROR)
+
+    async def continue_with_challenge(self, challenge_meta: ChallengeMeta, challenge_dir: str) -> None:
+        """Reuse this Codex thread and Docker sandbox for the next objective."""
+        from backend.prompts import build_continuation_prompt, list_distfiles
+        from backend.sandbox import stage_challenge_into_workspace
+
+        if not self._thread_id or not self._proc:
+            raise RuntimeError("Cannot continue before the Codex thread has started")
+        if not self.sandbox or not self.sandbox.workspace_dir:
+            raise RuntimeError("Cannot continue without the existing sandbox workspace")
+
+        container_path = stage_challenge_into_workspace(
+            self.sandbox.workspace_dir,
+            challenge_dir,
+            challenge_meta.name,
+        )
+        previous = self.meta.name
+        self.challenge_dir = challenge_dir
+        self.meta = challenge_meta
+        self._confirmed = False
+        self._flag = None
+        self._structured_output = None
+        self._turn_error = None
+        self._pending_prompt = build_continuation_prompt(
+            challenge_meta,
+            container_path,
+            list_distfiles(challenge_dir),
+        )
+        self.agent_name = f"{challenge_meta.name}/{self.model_id}"
+        self._cost_usd = 0.0
+        self.loop_detector.reset()
+        self.tracer.event(
+            "scenario_continued",
+            from_challenge=previous,
+            to_challenge=challenge_meta.name,
+            thread_id=self._thread_id,
+            sandbox_reused=True,
+        )
+        self.tracer.close()
+        self.tracer = SolverTracer(challenge_meta.name, self.model_id)
+        self.tracer.event(
+            "scenario_continued",
+            from_challenge=previous,
+            to_challenge=challenge_meta.name,
+            thread_id=self._thread_id,
+        )
+        logger.info(
+            "[%s] Continuing on %s with thread %s",
+            self.agent_name,
+            challenge_meta.name,
+            self._thread_id,
+        )
 
     def bump(self, insights: str) -> None:
         self._bump_insights = insights

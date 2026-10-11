@@ -7,9 +7,10 @@ from backend.tools.core import do_submit_flag
 
 
 async def submit_flag(ctx: RunContext[SolverDeps], flag: str) -> str:
-    """Submit a flag to CTFd to verify it. Always call this before reporting a flag.
+    """Report a candidate flag to the control plane, which verifies it with CTFd.
 
-    Returns CORRECT, ALREADY SOLVED, or INCORRECT.
+    Returns CORRECT, ALREADY SOLVED, INCORRECT, RETRYABLE_ERROR, or FATAL_ERROR.
+    RETRYABLE_ERROR means CTFd did not judge the flag; submit the same candidate again.
     Do NOT submit placeholder flags like CTF{flag} or CTF{placeholder}.
     """
     if ctx.deps.no_submit:
