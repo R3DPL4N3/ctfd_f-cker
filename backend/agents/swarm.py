@@ -66,8 +66,13 @@ class ChallengeSwarm:
     _winner_spec: str | None = None
     _continuation_decided: bool = False
     _wait_generation: int = 0
-    _continuation_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+    _continuation_event: asyncio.Event = field(default_factory=asyncio.Event)
+    _continuation_payload: tuple[ChallengeMeta, str] | None = None
+    _continue_barrier: asyncio.Barrier | None = None
+    _stage_interrupt: asyncio.Event = field(default_factory=asyncio.Event)
+    _stage_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _solver_tasks: dict[str, asyncio.Task] = field(default_factory=dict)
+    _stage_run_tasks: dict[str, asyncio.Task] = field(default_factory=dict)
 
     def _create_solver(self, model_spec: str):
         """Create the right solver type based on provider.
@@ -259,20 +264,28 @@ class ChallengeSwarm:
                 logger.exception("[%s] Flag-accepted hook failed", self.meta.name)
         return display, accepted
 
+    def _live_solver_count(self) -> int:
+        return sum(1 for task in self._solver_tasks.values() if not task.done())
+
+    def _arm_continuation(self, payload: tuple[ChallengeMeta, str] | None) -> None:
+        parties = max(self._live_solver_count(), 1)
+        self._continue_barrier = asyncio.Barrier(parties)
+        self._continuation_payload = payload
+        self._continuation_decided = True
+        self._continuation_event.set()
+
     def offer_continuation(self, meta: ChallengeMeta, challenge_dir: str) -> bool:
-        """Queue the next stage for the living winner. Safe to call before the solver waits."""
+        """Broadcast the next stage to every retained solver. Safe before waiters exist."""
         if not self.scenario_mode or self._continuation_decided:
             return False
-        self._continuation_decided = True
-        self._continuation_queue.put_nowait((meta, challenge_dir))
+        self._arm_continuation((meta, challenge_dir))
         return True
 
     def finish_scenario_wait(self) -> None:
-        """Unblock a solver that is waiting for an unlock. Does not destroy the sandbox."""
+        """Unblock solvers waiting for an unlock. Does not destroy sandboxes."""
         if self._continuation_decided:
             return
-        self._continuation_decided = True
-        self._continuation_queue.put_nowait(None)
+        self._arm_continuation(None)
 
     async def wait_for_continuation(self) -> tuple[ChallengeMeta, str] | None:
         timeout_task: asyncio.Task | None = None
@@ -282,7 +295,17 @@ class ChallengeSwarm:
                 name=f"scenario-wait-{self.meta.name}",
             )
         try:
-            return await self._continuation_queue.get()
+            await self._continuation_event.wait()
+            payload = self._continuation_payload
+            if self.cancel_event.is_set():
+                return payload
+            barrier = self._continue_barrier
+            if barrier is not None:
+                try:
+                    await barrier.wait()
+                except asyncio.BrokenBarrierError:
+                    pass
+            return payload
         finally:
             if timeout_task is not None:
                 timeout_task.cancel()
@@ -330,21 +353,33 @@ class ChallengeSwarm:
         self._submit_count.clear()
         self._last_submit_time.clear()
         self._continuation_decided = False
+        self._continuation_payload = None
+        self._continue_barrier = None
+        self._continuation_event = asyncio.Event()
+        self._stage_interrupt = asyncio.Event()
         self._wait_generation += 1
-        while not self._continuation_queue.empty():
-            try:
-                self._continuation_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
 
-    async def _stop_siblings(self, winner_spec: str) -> None:
-        pending = [
-            task
-            for spec, task in self._solver_tasks.items()
-            if spec != winner_spec and not task.done()
-        ]
-        for task in pending:
-            task.cancel()
+    async def _cancel_sibling_runs(self, winner_spec: str) -> None:
+        """Cancel losing solvers' current challenge runs. Keep instances and sandboxes."""
+        self._stage_interrupt.set()
+        pending: list[asyncio.Task] = []
+        session_id = self.scenario_session.id if self.scenario_session else "scenario"
+        for spec, solver in self.solvers.items():
+            if spec == winner_spec:
+                continue
+            cancel = getattr(solver, "cancel_current_run", None)
+            if callable(cancel):
+                cancel()
+            task = self._stage_run_tasks.get(spec)
+            if task is not None and not task.done() and not callable(cancel):
+                task.cancel()
+            if task is not None and not task.done():
+                pending.append(task)
+            logger.info(
+                "[%s] Current stage run cancelled; solver retained for %s",
+                getattr(solver, "agent_name", spec),
+                session_id,
+            )
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
 
@@ -354,15 +389,37 @@ class ChallengeSwarm:
             return
         self.scenario_registry.stop_session(session.id, output_dir=self.scenario_writeup_dir)
 
+    def _solver_closed(self, solver: Any) -> bool:
+        return bool(getattr(solver, "_closed", False))
+
+    def _scenario_id(self) -> str:
+        session = self.scenario_session
+        return session.id if session is not None else "scenario"
+
+    async def _close_solver(self, solver: Any) -> None:
+        closer = getattr(solver, "close", None)
+        if callable(closer):
+            await closer()
+            return
+        await solver.stop()
+
     async def _run_solver(self, model_spec: str) -> SolverResult | None:
-        solver = self._create_solver(model_spec)
+        solver = self.solvers.get(model_spec)
+        already_started = solver is not None and not self._solver_closed(solver)
+        if solver is None or self._solver_closed(solver):
+            solver = self._create_solver(model_spec)
+            already_started = False
         self.solvers[model_spec] = solver
+        if self.scenario_session is not None:
+            self.scenario_session.metadata["solvers"] = self.solvers
         current = asyncio.current_task()
         if current is not None:
             self._solver_tasks[model_spec] = current
 
         try:
-            result, final_solver = await self._run_solver_loop(solver, model_spec)
+            result, final_solver = await self._run_solver_loop(
+                solver, model_spec, already_started=already_started,
+            )
             solver = final_solver
             return result
         except asyncio.CancelledError:
@@ -371,21 +428,100 @@ class ChallengeSwarm:
             logger.error(f"[{self.meta.name}/{model_spec}] Fatal: {e}", exc_info=True)
             return None
         finally:
-            await solver.stop()
+            await self._close_solver(solver)
 
-    async def _run_solver_loop(self, solver, model_spec: str) -> tuple[SolverResult, SolverProtocol]:
-        """Inner loop: start → run → bump → run → ..."""
+    async def _await_stage_run(self, solver, model_spec: str) -> SolverResult:
+        """Run one challenge attempt as a cancellable task, without closing the solver."""
+        task = asyncio.create_task(
+            solver.run_until_done_or_gave_up(),
+            name=f"run-{self.meta.name}-{model_spec}",
+        )
+        self._stage_run_tasks[model_spec] = task
+        try:
+            return await task
+        except asyncio.CancelledError:
+            if not task.done():
+                cancel = getattr(solver, "cancel_current_run", None)
+                if callable(cancel):
+                    cancel()
+                else:
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            raise
+        finally:
+            if self._stage_run_tasks.get(model_spec) is task:
+                self._stage_run_tasks.pop(model_spec, None)
+
+    async def _continue_solver(self, solver, model_spec: str) -> bool:
+        """Adopt the next stage on this solver. Returns False when the scenario is over."""
+        continuation = await self.wait_for_continuation()
+        if continuation is None:
+            return False
+        next_meta, next_dir = continuation
+        async with self._stage_lock:
+            if self.meta.name != next_meta.name or self.challenge_dir != next_dir:
+                self._prepare_next_stage(next_meta, next_dir)
+        if not hasattr(solver, "continue_with_challenge"):
+            logger.warning("[%s] Solver cannot continue an existing session", model_spec)
+            return False
+        await solver.continue_with_challenge(next_meta, next_dir)
+        sandbox_id = None
+        try:
+            sandbox_id = solver.sandbox.container_id
+        except Exception:
+            logger.debug("Sandbox id unavailable after continuation", exc_info=True)
+        logger.info("[%s] Continuing solver in %s", solver.agent_name, self._scenario_id())
+        if sandbox_id:
+            logger.info("[%s] Reused sandbox %s", solver.agent_name, sandbox_id)
+        else:
+            logger.info("[%s] Reused sandbox", solver.agent_name)
+        return True
+
+    async def _wait_for_stage_or_cancel(self, timeout: float) -> str:
+        """Return 'timeout', 'shutdown', or 'stage'."""
+        shutdown = asyncio.create_task(self.cancel_event.wait())
+        stage = asyncio.create_task(self._stage_interrupt.wait())
+        try:
+            done, pending = await asyncio.wait(
+                {shutdown, stage},
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            if not done:
+                return "timeout"
+            if self.cancel_event.is_set():
+                return "shutdown"
+            return "stage"
+        except asyncio.CancelledError:
+            shutdown.cancel()
+            stage.cancel()
+            await asyncio.gather(shutdown, stage, return_exceptions=True)
+            raise
+
+    async def _run_solver_loop(
+        self,
+        solver,
+        model_spec: str,
+        *,
+        already_started: bool = False,
+    ) -> tuple[SolverResult, SolverProtocol]:
+        """Inner loop: start → run → bump → run → ... Solver instance survives sibling cancel."""
         bump_count = 0
         consecutive_errors = 0
         result = SolverResult(
             flag=None, status=CANCELLED, findings_summary="",
             step_count=0, cost_usd=0.0, log_path="",
         )
-        await solver.start()
+        if not already_started:
+            await solver.start()
         self._bind_solver_memory(solver)
 
         while not self.cancel_event.is_set():
-            result = await solver.run_until_done_or_gave_up()
+            result = await self._await_stage_run(solver, model_spec)
 
             # Only broadcast useful findings — skip errors and broken solvers
             if (result.status not in (ERROR, QUOTA_ERROR)
@@ -422,20 +558,20 @@ class ChallengeSwarm:
                     self.cancel_event.set()
                     return result, solver
 
-                await self._stop_siblings(model_spec)
-                continuation = await self.wait_for_continuation()
-                if continuation is None:
+                await self._cancel_sibling_runs(model_spec)
+                if not await self._continue_solver(solver, model_spec):
                     return result, solver
-                next_meta, next_dir = continuation
-                if not hasattr(solver, "continue_with_challenge"):
-                    logger.warning("[%s] Solver cannot continue an existing session", model_spec)
-                    return result, solver
-                self._prepare_next_stage(next_meta, next_dir)
-                await solver.continue_with_challenge(next_meta, next_dir)
-                logger.info("[%s] Reused solver for %s", model_spec, next_meta.name)
                 continue
 
             if result.status == CANCELLED:
+                if self.scenario_mode and not self.cancel_event.is_set():
+                    logger.info(
+                        "[%s] Current stage run cancelled; solver retained for %s",
+                        getattr(solver, "agent_name", model_spec),
+                        self._scenario_id(),
+                    )
+                    if await self._continue_solver(solver, model_spec):
+                        continue
                 break
 
             if result.status == QUOTA_ERROR:
@@ -463,15 +599,18 @@ class ChallengeSwarm:
                     consecutive_errors = 0
 
                 bump_count += 1
-                # Cooldown between bumps — check cancellation during wait
-                try:
-                    await asyncio.wait_for(
-                        self.cancel_event.wait(),
-                        timeout=min(bump_count * 30, 300),
+                interrupt = await self._wait_for_stage_or_cancel(min(bump_count * 30, 300))
+                if interrupt == "shutdown":
+                    break
+                if interrupt == "stage":
+                    logger.info(
+                        "[%s] Current stage run cancelled; solver retained for %s",
+                        getattr(solver, "agent_name", model_spec),
+                        self._scenario_id(),
                     )
-                    break  # cancelled during cooldown
-                except TimeoutError:
-                    pass  # cooldown elapsed, proceed with bump
+                    if await self._continue_solver(solver, model_spec):
+                        continue
+                    break
                 insights = self._gather_sibling_insights(model_spec)
                 solver.bump(insights)
                 logger.info(
@@ -480,6 +619,22 @@ class ChallengeSwarm:
                 continue
 
         return result, solver
+
+    async def ensure_solver_tasks(self) -> int:
+        """Start a missing outer solver task for each expected model. Idempotent."""
+        if self.cancel_event.is_set():
+            return 0
+        started = 0
+        for spec in self.model_specs:
+            task = self._solver_tasks.get(spec)
+            if task is not None and not task.done():
+                continue
+            self._solver_tasks[spec] = asyncio.create_task(
+                self._run_solver(spec),
+                name=f"solver-{spec}",
+            )
+            started += 1
+        return started
 
     async def run(self) -> SolverResult | None:
         """Run all solvers in parallel. Returns the winner's result or None."""
@@ -494,14 +649,14 @@ class ChallengeSwarm:
             self._finalize_scenario()
 
     async def _run_all(self) -> SolverResult | None:
-        tasks = [
-            asyncio.create_task(self._run_solver(spec), name=f"solver-{spec}")
-            for spec in self.model_specs
-        ]
+        await self.ensure_solver_tasks()
 
         try:
-            while tasks:
-                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            while True:
+                live = [task for task in self._solver_tasks.values() if not task.done()]
+                if not live:
+                    break
+                done, pending = await asyncio.wait(live, return_when=asyncio.FIRST_COMPLETED)
 
                 for task in done:
                     try:
@@ -518,12 +673,17 @@ class ChallengeSwarm:
                         ):
                             continue
                         self.cancel_event.set()
-                        for waiting in pending:
-                            waiting.cancel()
-                        await asyncio.gather(*pending, return_exceptions=True)
+                        self.finish_scenario_wait()
+                        waiting = [
+                            other
+                            for other in self._solver_tasks.values()
+                            if other is not task and not other.done()
+                        ]
+                        for other in waiting:
+                            other.cancel()
+                        if waiting:
+                            await asyncio.gather(*waiting, return_exceptions=True)
                         return result
-
-                tasks = list(pending)
 
             self.cancel_event.set()
             return self.winner
@@ -532,15 +692,24 @@ class ChallengeSwarm:
         except Exception as e:
             logger.error(f"[{self.meta.name}] Swarm error: {e}", exc_info=True)
             self.cancel_event.set()
-            for task in tasks:
+            waiting = [task for task in self._solver_tasks.values() if not task.done()]
+            for task in waiting:
                 task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            if waiting:
+                await asyncio.gather(*waiting, return_exceptions=True)
             return None
 
     def kill(self) -> None:
-        """Cancel all agents for this challenge."""
+        """Cancel all agents for this scenario. Does not skip sandbox close on the outer tasks."""
         self.cancel_event.set()
         self.finish_scenario_wait()
+        for solver in self.solvers.values():
+            cancel = getattr(solver, "cancel_current_run", None)
+            if callable(cancel):
+                cancel()
+        for task in self._stage_run_tasks.values():
+            if not task.done():
+                task.cancel()
 
     def get_status(self) -> dict:
         """Get per-agent progress and findings."""

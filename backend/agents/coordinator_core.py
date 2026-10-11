@@ -90,11 +90,29 @@ def _retire_finished_swarms(deps: CoordinatorDeps) -> None:
         deps.swarm_tasks.pop(name, None)
 
 
+def _existing_swarm(deps: CoordinatorDeps, challenge_name: str) -> Any | None:
+    swarm = deps.swarms.get(challenge_name)
+    if swarm is not None:
+        return swarm
+    return find_swarm_for_challenge(deps, challenge_name)
+
+
 async def spawn_swarm_unlocked(deps: CoordinatorDeps, challenge_name: str) -> str:
-    """Create a swarm. Caller must hold deps.routing_lock."""
+    """Create a swarm, or reconcile solver tasks on a living scenario. Caller holds routing_lock."""
     _retire_finished_swarms(deps)
 
-    if challenge_name in deps.swarms:
+    existing = _existing_swarm(deps, challenge_name)
+    if existing is not None:
+        deps.swarms[challenge_name] = existing
+        started = 0
+        ensure = getattr(existing, "ensure_solver_tasks", None)
+        if callable(ensure):
+            started = await ensure()
+        if started:
+            return (
+                f"Swarm for {challenge_name} still running; "
+                f"started {started} missing solver task(s)"
+            )
         return f"Swarm still running for {challenge_name}"
 
     active_count = len(deps.swarms)
@@ -152,6 +170,7 @@ def _attach_scenario(deps: CoordinatorDeps, swarm: Any, meta: ChallengeMeta) -> 
         metadata={"tags": list(meta.tags), "swarm": swarm},
     )
     session.metadata["challenge_dirs"] = {meta.name: swarm.challenge_dir}
+    session.metadata["solvers"] = swarm.solvers
     swarm.scenario_mode = True
     swarm.scenario_session = session
     swarm.scenario_registry = deps.scenario_registry

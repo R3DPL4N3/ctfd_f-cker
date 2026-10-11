@@ -213,8 +213,12 @@ async def _continue_session(
     if session is None or session.state == "stopped":
         return False
     swarm = session.metadata.get("swarm")
-    solver = session.solver
-    if swarm is None or solver is None or not hasattr(solver, "continue_with_challenge"):
+    if swarm is None or not getattr(swarm, "scenario_mode", False):
+        return False
+    retained = list(getattr(swarm, "solvers", {}).values())
+    if session.solver is not None:
+        retained.append(session.solver)
+    if retained and not any(hasattr(solver, "continue_with_challenge") for solver in retained):
         return False
 
     from backend.agents.coordinator_core import ensure_challenge_materials

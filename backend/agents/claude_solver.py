@@ -84,8 +84,13 @@ class ClaudeSolver:
         self._findings = ""
         self._cost_usd = 0.0
         self._bump_insights: str | None = None
+        self._active_run: asyncio.Task | None = None
+        self._run_state = "idle"
+        self._closed = False
 
     async def start(self) -> None:
+        if self._client is not None:
+            return
         await self.sandbox.start()
 
         self._container_id = self.sandbox.container_id
@@ -285,6 +290,8 @@ class ClaudeSolver:
         t0 = time.monotonic()
         cost_before = self._cost_usd
         steps_before = self._step_count
+        self._run_state = "running"
+        self._active_run = asyncio.current_task()
 
         try:
             if self._bump_insights:
@@ -327,12 +334,11 @@ class ClaudeSolver:
                     )
 
                     output = getattr(message, "structured_output", None)
-                    if output:
-                        if output.get("type") == "flag_found":
-                            self._flag = output.get("flag")
-                            self._findings = f"Flag found via {output.get('method', '?')}: {self._flag}"
-                            if self.no_submit:
-                                self._confirmed = True
+                    if output and output.get("type") == "flag_found":
+                        self._flag = output.get("flag")
+                        self._findings = f"Flag found via {output.get('method', '?')}: {self._flag}"
+                        if self.no_submit:
+                            self._confirmed = True
 
             self.tracer.event("turn_complete", duration=round(time.monotonic() - t0, 1), cost=round(self._cost_usd, 4))
 
@@ -345,6 +351,7 @@ class ClaudeSolver:
             return self._result(GAVE_UP, run_steps=run_steps, run_cost=run_cost)
 
         except asyncio.CancelledError:
+            self._run_state = "cancelled_for_stage"
             return self._result(CANCELLED)
         except Exception as e:
             error_str = str(e)
@@ -354,6 +361,10 @@ class ClaudeSolver:
             if "quota" in error_str.lower() or "rate" in error_str.lower() or "overloaded" in error_str.lower():
                 return self._result(QUOTA_ERROR)
             return self._result(ERROR)
+        finally:
+            self._active_run = None
+            if self._run_state == "running":
+                self._run_state = "idle"
 
     def bump(self, insights: str) -> None:
         self._bump_insights = insights
@@ -372,7 +383,20 @@ class ClaudeSolver:
             log_path=self.tracer.path,
         )
 
+    def cancel_current_run(self) -> None:
+        self._run_state = "cancelled_for_stage"
+        task = self._active_run
+        if task is not None and not task.done():
+            task.cancel()
+
     async def stop(self) -> None:
+        await self.close()
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self.cancel_current_run()
         self.tracer.event("stop", step_count=self._step_count)
         self.tracer.close()
         if self._client:

@@ -145,7 +145,7 @@ async def run_event_loop(
                     )
                     if outcome == "continued":
                         parts.append(
-                            f"CONTINUED SCENARIO: '{evt.challenge_name}' reused the existing solver."
+                            f"CONTINUED SCENARIO: '{evt.challenge_name}' reused the existing scenario solvers."
                         )
                     elif outcome == "spawned":
                         parts.append(f"NEW CHALLENGE: '{evt.challenge_name}' — independent swarm spawned.")

@@ -177,6 +177,10 @@ class Solver:
         self._run_usage = RunUsage()
         self._usage_committed = False
         self._memory = None
+        self._active_run: asyncio.Task | None = None
+        self._run_state = "idle"
+        self._closed = False
+        self._scenario_id: str | None = None
 
     async def start(self) -> None:
         """Start the sandbox and build the agent."""
@@ -227,6 +231,8 @@ class Solver:
         t0 = time.monotonic()
         self._run_usage = RunUsage()
         self._usage_committed = False
+        self._run_state = "running"
+        self._active_run = asyncio.current_task()
 
         try:
             from pydantic_ai.usage import UsageLimits
@@ -280,6 +286,7 @@ class Solver:
             return self._result(GAVE_UP)
 
         except asyncio.CancelledError:
+            self._run_state = "cancelled_for_stage"
             self._commit_run_usage(duration_seconds=time.monotonic() - t0)
             return self._result(CANCELLED)
         except Exception as e:
@@ -288,6 +295,10 @@ class Solver:
             self.tracer.event("error", error=str(e))
             self._commit_run_usage(duration_seconds=time.monotonic() - t0)
             return self._result(ERROR)
+        finally:
+            self._active_run = None
+            if self._run_state == "running":
+                self._run_state = "idle"
 
     async def continue_with_challenge(self, challenge_meta: ChallengeMeta, challenge_dir: str) -> None:
         """Keep this agent, its message history, and its sandbox. Do not start a new container."""
@@ -327,13 +338,24 @@ class Solver:
         self._run_usage = RunUsage()
         self._usage_committed = False
         self.loop_detector.reset()
+        self._run_state = "idle"
         self.tracer.event(
             "scenario_continued",
             from_challenge=previous,
             to_challenge=challenge_meta.name,
             sandbox_reused=True,
         )
-        logger.info("[%s] Continuing on %s in the existing sandbox", self.agent_name, challenge_meta.name)
+        session_id = self._scenario_id or "scenario"
+        logger.info("[%s] Continuing solver in %s", self.agent_name, session_id)
+        sandbox_id = None
+        try:
+            sandbox_id = self.sandbox.container_id
+        except Exception:
+            logger.debug("Sandbox id unavailable", exc_info=True)
+        if sandbox_id:
+            logger.info("[%s] Reused sandbox %s", self.agent_name, sandbox_id)
+        else:
+            logger.info("[%s] Reused sandbox", self.agent_name)
 
     def bump(self, insights: str) -> None:
         """Inject insights from siblings and prepare to resume."""
@@ -392,10 +414,18 @@ class Solver:
         return str(self._memory.json_path)
 
     def bind_scenario(self, scenario_id: str) -> None:
+        self._scenario_id = scenario_id
         if self._memory is None:
             self._init_memory()
         if self._memory is not None:
             self._memory.set_scenario_id(scenario_id)
+
+    def cancel_current_run(self) -> None:
+        """Cancel the active challenge invocation. Keep sandbox, memory, and history."""
+        self._run_state = "cancelled_for_stage"
+        task = self._active_run
+        if task is not None and not task.done():
+            task.cancel()
 
     def _result(self, status: str, run_steps: int | None = None, run_cost: float | None = None) -> SolverResult:
         self._commit_run_usage()
@@ -423,6 +453,14 @@ class Solver:
         )
 
     async def stop(self) -> None:
+        await self.close()
+
+    async def close(self) -> None:
+        """Terminal scenario cleanup: release the model run, tracer, and sandbox."""
+        if self._closed:
+            return
+        self._closed = True
+        self.cancel_current_run()
         self.tracer.event("stop", step_count=self._step_count[0])
         self.tracer.close()
         if self._owns_sandbox and self.sandbox:

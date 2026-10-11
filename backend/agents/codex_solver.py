@@ -274,8 +274,14 @@ class CodexSolver:
         self._pending_responses: dict[int, asyncio.Future] = {}
         self._reader_task: asyncio.Task | None = None
         self._turn_done: asyncio.Event = asyncio.Event()
+        self._active_run: asyncio.Task | None = None
+        self._run_state = "idle"
+        self._closed = False
+        self._scenario_id: str | None = None
 
     async def start(self) -> None:
+        if self._proc is not None:
+            return
         await self.sandbox.start()
         self._init_memory()
 
@@ -586,6 +592,8 @@ class CodexSolver:
         assert self._thread_id
 
         t0 = time.monotonic()
+        self._run_state = "running"
+        self._active_run = asyncio.current_task()
         if self._pending_prompt:
             prompt_text = self._pending_prompt
             self._pending_prompt = None
@@ -645,6 +653,7 @@ class CodexSolver:
             return self._result(GAVE_UP)
 
         except asyncio.CancelledError:
+            self._run_state = "cancelled_for_stage"
             return self._result(CANCELLED)
         except Exception as e:
             error_str = str(e)
@@ -654,6 +663,10 @@ class CodexSolver:
             if "quota" in error_str.lower() or "rate" in error_str.lower():
                 return self._result(QUOTA_ERROR)
             return self._result(ERROR)
+        finally:
+            self._active_run = None
+            if self._run_state == "running":
+                self._run_state = "idle"
 
     async def continue_with_challenge(self, challenge_meta: ChallengeMeta, challenge_dir: str) -> None:
         """Reuse this Codex thread and Docker sandbox for the next objective."""
@@ -711,6 +724,15 @@ class CodexSolver:
             to_challenge=challenge_meta.name,
             thread_id=self._thread_id,
         )
+        session_id = self._scenario_id or "scenario"
+        logger.info("[%s] Continuing solver in %s", self.agent_name, session_id)
+        sandbox_id = None
+        try:
+            sandbox_id = self.sandbox.container_id
+        except Exception:
+            logger.debug("Sandbox id unavailable", exc_info=True)
+        if sandbox_id:
+            logger.info("[%s] Reused sandbox %s", self.agent_name, sandbox_id)
         logger.info(
             "[%s] Continuing on %s with thread %s",
             self.agent_name, challenge_meta.name, self._thread_id,
@@ -723,10 +745,18 @@ class CodexSolver:
         return str(self._memory.json_path)
 
     def bind_scenario(self, scenario_id: str) -> None:
+        self._scenario_id = scenario_id
         if self._memory is None:
             self._init_memory()
         if self._memory is not None:
             self._memory.set_scenario_id(scenario_id)
+
+    def cancel_current_run(self) -> None:
+        """Cancel the active Codex turn. Keep the app-server process and sandbox."""
+        self._run_state = "cancelled_for_stage"
+        task = self._active_run
+        if task is not None and not task.done():
+            task.cancel()
 
     def _on_compaction_event(self, params: dict | None = None) -> None:
         turn_id = _compaction_turn_id(params)
@@ -810,6 +840,13 @@ class CodexSolver:
         )
 
     async def stop(self) -> None:
+        await self.close()
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self.cancel_current_run()
         self.tracer.event("stop", step_count=self._step_count)
         self.tracer.close()
         if self._reader_task:
