@@ -109,12 +109,74 @@ async def memory_update(
         if value
     }
     state = store.update(payload)
+    if ctx.deps.campaign is not None:
+        await ctx.deps.campaign.publish(payload, ctx.deps.challenge_name)
     from backend.scenario_memory import render_markdown
 
     return (
         "Memory updated. Secrets are stored in scenario-state.json and are not echoed here.\n\n"
         + render_markdown(state)
     )
+
+
+
+
+async def campaign_search(ctx: RunContext[SolverDeps], query: str = "", limit: int = 30) -> str:
+    """Search durable cross-challenge intelligence. Secret values are redacted."""
+    if ctx.deps.campaign is None:
+        return "Campaign unavailable"
+    return ctx.deps.campaign.search(query, limit)
+
+
+async def campaign_publish(
+    ctx: RunContext[SolverDeps],
+    targets: list[dict[str, Any]] | None = None,
+    credentials: list[dict[str, Any]] | None = None,
+    sessions: list[dict[str, Any]] | None = None,
+    networks: list[dict[str, Any]] | None = None,
+    findings: list[str] | None = None,
+    artifacts: list[str] | None = None,
+) -> str:
+    """Publish findings into encrypted host-owned campaign state."""
+    if ctx.deps.campaign is None:
+        return "Campaign unavailable"
+    return await ctx.deps.campaign.publish(
+        {key: value for key, value in {
+            "targets": targets, "credentials": credentials, "sessions": sessions,
+            "networks": networks, "findings": findings, "artifacts": artifacts,
+        }.items() if value}, ctx.deps.challenge_name
+    )
+
+
+async def campaign_get_credential(ctx: RunContext[SolverDeps], ref: str) -> str:
+    """Explicitly retrieve one credential from the encrypted campaign vault."""
+    if ctx.deps.campaign is None:
+        return "Campaign unavailable"
+    return ctx.deps.campaign.credential(ref)
+
+
+async def campaign_stage_hash(ctx: RunContext[SolverDeps], path: str) -> str:
+    """Stage a hash artifact under the durable host job store."""
+    if ctx.deps.campaign is None:
+        return "Campaign unavailable"
+    return await ctx.deps.campaign.stage_hash(
+        ctx.deps.sandbox, path, ctx.deps.challenge_name
+    )
+
+
+async def campaign_job_submit(ctx: RunContext[SolverDeps], artifact_id: str,
+                              principal: str, hash_type: str, engine: str = "john") -> str:
+    """Start a detached offline cracking job; never runs model-provided shell commands."""
+    if ctx.deps.campaign is None:
+        return "Campaign unavailable"
+    return ctx.deps.campaign.job_submit(artifact_id, principal, hash_type, engine)
+
+
+async def campaign_job_status(ctx: RunContext[SolverDeps], job_id: str) -> str:
+    """Read background job progress without returning cracked secrets."""
+    if ctx.deps.campaign is None:
+        return "Campaign unavailable"
+    return ctx.deps.campaign.job_status(job_id)
 
 
 async def webhook_create(ctx: RunContext[SolverDeps]) -> str:
