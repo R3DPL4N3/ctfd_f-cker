@@ -162,6 +162,9 @@ class CampaignStore:
                         raise ValueError("hash must be text")
                     identity = (domain + "\\" + username).casefold()
                     old = db.execute("SELECT * FROM credentials WHERE identity=?", (identity,)).fetchone()
+                    # A new unverified candidate must not overwrite an already verified secret.
+                    if old and old["status"] == "verified" and item.get("verified") is not True:
+                        continue
                     status = "verified" if item.get("verified") is True else "reported"
                     if old and old["status"] == "verified" and not password and not password_hash:
                         status = "verified"
