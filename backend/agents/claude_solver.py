@@ -52,6 +52,7 @@ class ClaudeSolver:
         submit_fn=None,
         message_bus=None,
         notify_coordinator=None,
+        campaign=None,
     ) -> None:
         self.model_spec = model_spec
         self.model_id = model_id_from_spec(model_spec)
@@ -65,6 +66,7 @@ class ClaudeSolver:
         self.submit_fn = submit_fn
         self.message_bus = message_bus
         self.notify_coordinator = notify_coordinator
+        self.campaign = campaign
 
         self.sandbox = DockerSandbox(
             image=getattr(settings, "sandbox_image", "ctf-sandbox"),
@@ -111,6 +113,14 @@ class ClaudeSolver:
             self.meta, distfile_names, container_arch=container_arch,
             has_named_tools=False,
         )
+        if self.campaign is not None:
+            system_prompt += (
+                "\n\n## Shared Campaign Intelligence\n"
+                "The following credential references and findings survived application restarts. "
+                "Do not redo completed reconnaissance; report new findings with notify_coordinator. "
+                "Do not confuse a candidate flag with a CTFd-accepted solve.\n"
+                + self.campaign.search("", 25)
+            )
 
         # PreToolUse hook: rewrite Bash commands to run in the sandbox container.
         # Block Read/Write/Edit — model should use bash for file access.
