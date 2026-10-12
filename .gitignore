@@ -1,6 +1,9 @@
 # Credentials
 .env
 creds.json
+campaign-import*.json
+*.ctf-creds.json
+vault.key
 
 # Logs and traces
 logs/
