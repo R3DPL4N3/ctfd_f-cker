@@ -16,6 +16,7 @@ dependencies = [
     "click",
     "markdownify",
     "cryptography>=43",
+    "cryptography>=43",
 ]
 
 [project.scripts]
