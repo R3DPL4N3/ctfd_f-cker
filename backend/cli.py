@@ -129,6 +129,10 @@ async def _run_single(
         password=settings.ctfd_pass,
     )
     cost_tracker = CostTracker()
+    from backend.campaign_service import CampaignService
+
+    campaign = CampaignService(settings)
+    campaign.resume_incomplete()
 
     swarm = ChallengeSwarm(
         challenge_dir=str(challenge_path),
@@ -138,7 +142,10 @@ async def _run_single(
         settings=settings,
         model_specs=model_specs,
         no_submit=no_submit,
+        campaign=campaign,
     )
+    campaign.register_bus(swarm.message_bus)
+    campaign.store.mark_stage(meta.name, "active")
 
     try:
         result = await swarm.run()
