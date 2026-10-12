@@ -214,6 +214,37 @@ includes it). Hashcat is optional: provide an image with Hashcat installed or us
 the native runner with a host-installed Hashcat. A host-accessible wordlist is required.
 For locally installed tools use `CTF_CAMPAIGN_JOB_RUNNER=native`.
 
+### Importing yesterday's findings
+
+This feature does **not** retroactively recover deleted Docker workspaces or reconstruct
+secrets from trace logs. To seed a new campaign, prepare an operator-reviewed JSON file
+outside the repository with the same keys accepted by memory_update:
+
+~~~json
+{
+  "targets": [{"host": "10.20.103.110", "hostname": "WEB"}],
+  "credentials": [{"domain": "VERIMARKT", "username": "EXAMPLE_USER", "password": "REPLACE_WITH_VALIDATED_SECRET", "verified": true}],
+  "findings": ["WIN-103 is not accepted; any placeholder-looking flag remains unverified"]
+}
+~~~
+
+Do not use the example account as a real credential. Save actual validated values only
+in a private file and set owner-only permissions. Import **before** starting the swarm,
+using the same campaign ID as the next run:
+
+~~~bash
+chmod 600 /tmp/ctf-campaign-import.json
+CTF_CAMPAIGN_ID=verimarkt-sydt uv run python -m backend.campaign_cli \
+  /tmp/ctf-campaign-import.json --challenge WIN-103
+rm -f /tmp/ctf-campaign-import.json
+~~~
+
+Never commit the plaintext import file or vault key. New solver prompts include a
+redacted campaign snapshot; explicit credential retrieval remains a separate tool.
+Background jobs require an operator-installed John Jumbo or a compatible Docker
+image, plus CTF_CAMPAIGN_WORDLIST. They do not launch until the wordlist is configured.
+On an existing lab reset, revalidate old credentials and network sessions before use.
+
 Shared memory survives process and sandbox restarts, but live SSH tunnels,
 Kerberos tickets and sessions do not; revalidate those after lab reset.
 A candidate flag never marks a stage solved: only CTFd acceptance does.
