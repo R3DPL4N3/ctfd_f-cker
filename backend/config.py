@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings
 
 
@@ -37,9 +38,9 @@ class Settings(BaseSettings):
     # How long a solved scenario solver keeps its sandbox while CTFd unlocks the next stage.
     scenario_unlock_wait_seconds: int = 120
     # Stable across restarts; derived from CTFd URL/category if left empty.
-    campaign_id: str = ""
-    campaign_data_dir: str = ""
-    campaign_wordlist: str = ""
-    campaign_job_runner: str = "docker"
+    campaign_id: str = Field(default="", validation_alias=AliasChoices("CTF_CAMPAIGN_ID", "CAMPAIGN_ID"))
+    campaign_data_dir: str = Field(default="", validation_alias=AliasChoices("CTF_CAMPAIGN_DATA_DIR", "CAMPAIGN_DATA_DIR"))
+    campaign_wordlist: str = Field(default="", validation_alias=AliasChoices("CTF_CAMPAIGN_WORDLIST", "CAMPAIGN_WORDLIST"))
+    campaign_job_runner: str = Field(default="docker", validation_alias=AliasChoices("CTF_CAMPAIGN_JOB_RUNNER", "CAMPAIGN_JOB_RUNNER"))
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
