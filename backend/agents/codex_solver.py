@@ -577,7 +577,14 @@ class CodexSolver:
             self.tracer.event("loop_break", tool=tool_name, step=self._step_count)
             result = "Loop detected — try a completely different approach."
         else:
-            result = await self._exec_tool(tool_name, args)
+            try:
+                result = await self._exec_tool(tool_name, args)
+            except Exception as exc:
+                # A missing wordlist, stale credential ref or malformed job request
+                # must never kill the Codex RPC reader and stall the whole swarm.
+                logger.warning("[%s] Tool %s failed (%s)", self.agent_name,
+                               tool_name, type(exc).__name__)
+                result = f"Tool {tool_name} failed ({type(exc).__name__}); check arguments and prerequisites."
             if loop_status == "warn" and isinstance(result, str):
                 from backend.loop_detect import LOOP_WARNING_MESSAGE
                 result = f"{result}\n\n{LOOP_WARNING_MESSAGE}"
