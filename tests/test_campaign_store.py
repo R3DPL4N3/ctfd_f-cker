@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from backend.campaign_jobs import BackgroundJobs
+from backend.campaign_jobs import BackgroundJobs, _hashcat_mode
 from backend.campaign_service import CampaignService
 from backend.campaign_store import CampaignStore, campaign_identity
 
@@ -132,3 +132,38 @@ def test_background_jobs_dedupe_and_resume(tmp_path, monkeypatch):
     assert jobs.resume_incomplete() == 1
     assert started == [first["id"], first["id"]]
     assert jobs.get(first["id"])["status"] == "queued"
+
+
+
+@pytest.mark.parametrize(
+    ("kind", "signature", "expected"),
+    [
+        ("ntlm", b"0123456789abcdef0123456789abcdef", "1000"),
+        ("krb5asrep", b"$krb5asrep$23$user:test", "18200"),
+        ("krb5asrep", b"$krb5asrep$17$user:test", "32100"),
+        ("krb5asrep", b"$krb5asrep$18$user:test", "32200"),
+        ("krb5tgs", b"$krb5tgs$23$*user*:x", "13100"),
+        ("krb5tgs", b"$krb5tgs$17$*user*:x", "19600"),
+        ("krb5tgs", b"$krb5tgs$18$*user*:x", "19700"),
+    ],
+)
+def test_hashcat_selects_correct_etype(tmp_path, kind, signature, expected):
+    path = tmp_path / "ticket.hash"
+    path.write_bytes(signature)
+    assert _hashcat_mode(kind, path) == expected
+
+
+def test_hashcat_rejects_unknown_etype(tmp_path):
+    path = tmp_path / "ticket.hash"
+    path.write_bytes(b"$krb5tgs$99$*user*:x")
+    with pytest.raises(ValueError, match="etype"):
+        _hashcat_mode("krb5tgs", path)
+
+
+def test_campaign_search_can_match_domain_separator(tmp_path):
+    store = CampaignStore(tmp_path)
+    store.publish(
+        {"credentials": [{"domain": "VERIMARKT", "username": "cem", "password": "secret"}]},
+        "WIN-103",
+    )
+    assert len(store.search(r"VERIMARKT\cem")["credentials"]) == 1
