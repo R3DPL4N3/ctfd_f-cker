@@ -23,6 +23,24 @@ FORMATS = {
 }
 
 
+def _hashcat_mode(hash_type: str, artifact: Path) -> str:
+    """Select Hashcat mode from the observed Kerberos etype, never guess RC4."""
+    if hash_type == "ntlm":
+        return "1000"
+    signature = artifact.open("rb").read(120).lstrip()
+    modes = (
+        {"23": "18200", "17": "32100", "18": "32200"}
+        if hash_type == "krb5asrep"
+        else {"23": "13100", "17": "19600", "18": "19700"}
+    )
+    kind = "asrep" if hash_type == "krb5asrep" else "tgs"
+    for etype, mode in modes.items():
+        if signature.startswith(("$krb5" + kind + "$" + etype + "$").encode()):
+            return mode
+    raise ValueError("Unsupported Kerberos hash signature/etype for Hashcat")
+
+
+
 def _alive(pid: int | None) -> bool:
     if not pid or pid < 2:
         return False
@@ -64,14 +82,16 @@ class BackgroundJobs:
             raise ValueError("Unsupported offline cracker engine/hash type")
         if not principal or len(principal) > 256:
             raise ValueError("principal required (max 256 chars)")
-        self.store.artifact_path(artifact_id)
+        artifact = self.store.artifact_path(artifact_id)
+        if engine == "hashcat":
+            _hashcat_mode(hash_type, artifact)
         wordlist = self._wordlist()
         if self.runner == "native" and not shutil.which(
             self.john if engine == "john" else self.hashcat
         ):
             raise RuntimeError(f"{engine} is not installed on the host")
         fingerprint = hashlib.sha256(
-            f"{engine}|{hash_type}|{artifact_id}|{principal.casefold()}|{wordlist}".encode()
+            f"{engine}|{hash_type}|{artifact_id}|{principal.casefold()}|{wordlist}|{wordlist.stat().st_size}|{wordlist.stat().st_mtime_ns}".encode()
         ).hexdigest()
         job_id = fingerprint[:24]
         with self.store.connect() as db:
@@ -163,7 +183,8 @@ def _docker_prefix(jobdir: Path, artifact: Path, wordlist: Path, image: str) -> 
 
 def _command(row: Any, wordlist: Path, jobdir: Path,
              artifact: Path, runner: str, image: str, john: str, hashcat: str) -> list[str]:
-    john_format, hashcat_mode = FORMATS[row["hash_type"]]
+    john_format, _ = FORMATS[row["hash_type"]]
+    hashcat_mode = _hashcat_mode(row["hash_type"], artifact) if row["engine"] == "hashcat" else ""
     session = "ctf_" + row["id"]
     if runner == "docker":
         prefix = _docker_prefix(jobdir, artifact, wordlist, image)
@@ -225,9 +246,10 @@ def execute(root: str, job_id: str, wordlist: str, runner: str,
         else:
             output = jobdir / "cracked.txt"
             if output.exists():
+                original = artifact.read_text(encoding="utf-8", errors="replace").splitlines()[0]
                 for line in output.read_text(encoding="utf-8",errors="replace").splitlines():
-                    if ":" in line:
-                        password = line.rsplit(":",1)[-1]
+                    if line.startswith(original + ":"):
+                        password = line[len(original) + 1:]
                         break
         if password:
             domain, separator, username = row["principal"].rpartition("\\")
