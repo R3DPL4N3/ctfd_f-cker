@@ -213,6 +213,56 @@ SANDBOX_TOOLS = [
             },
         },
     },
+    {
+        "name": "campaign_search",
+        "description": "Search shared persistent campaign intelligence and redacted credential references. Call at start of a new stage.",
+        "inputSchema": {"type": "object", "properties": {
+            "query": {"type": "string"}, "limit": {"type": "integer"}
+        }},
+    },
+    {
+        "name": "campaign_publish",
+        "description": "Publish useful hosts, credentials, findings and sessions to all swarms. Credential values stay encrypted in host vault.",
+        "inputSchema": {"type": "object", "properties": {
+            "targets": {"type": "array", "items": {"type": "object"}},
+            "credentials": {"type": "array", "items": {"type": "object"}},
+            "sessions": {"type": "array", "items": {"type": "object"}},
+            "networks": {"type": "array", "items": {"type": "object"}},
+            "findings": {"type": "array", "items": {"type": "string"}},
+            "artifacts": {"type": "array", "items": {"type": "string"}},
+        }},
+    },
+    {
+        "name": "campaign_get_credential",
+        "description": "Retrieve one credential from encrypted host vault by reference, e.g. cred:4. Do not reprint secrets in notes or logs.",
+        "inputSchema": {"type": "object", "properties": {
+            "ref": {"type": "string"}
+        }, "required": ["ref"]},
+    },
+    {
+        "name": "campaign_stage_hash",
+        "description": "Store a hash file from sandbox workspace in the persistent host artifact store.",
+        "inputSchema": {"type": "object", "properties": {
+            "path": {"type": "string"}
+        }, "required": ["path"]},
+    },
+    {
+        "name": "campaign_job_submit",
+        "description": "Queue a deduplicated, network-isolated John/Hashcat offline cracking job; requires operator-provided wordlist.",
+        "inputSchema": {"type": "object", "properties": {
+            "artifact_id": {"type": "string"}, "principal": {"type": "string"},
+            "hash_type": {"type": "string", "enum": ["krb5asrep","krb5tgs","ntlm"]},
+            "engine": {"type": "string", "enum": ["john","hashcat"]}
+        }, "required": ["artifact_id","principal","hash_type"]},
+    },
+    {
+        "name": "campaign_job_status",
+        "description": "Read status of a detached offline job; no recovered passwords are included.",
+        "inputSchema": {"type": "object", "properties": {
+            "job_id": {"type": "string"}
+        }, "required": ["job_id"]},
+    },
+
 ]
 
 
@@ -232,6 +282,7 @@ class CodexSolver:
         submit_fn=None,
         message_bus=None,
         notify_coordinator=None,
+        campaign=None,
     ) -> None:
         self.model_spec = model_spec
         self.model_id = model_id_from_spec(model_spec)
@@ -239,6 +290,7 @@ class CodexSolver:
         self.meta = meta
         self.message_bus = message_bus
         self.notify_coordinator = notify_coordinator
+        self.campaign = campaign
         self.ctfd = ctfd
         self.cost_tracker = cost_tracker
         self.settings = settings
@@ -294,6 +346,14 @@ class CodexSolver:
             has_named_tools=True,
             include_memory=True,
         )
+        if self.campaign is not None:
+            system_prompt += (
+                "\n\n## Shared Campaign Memory (survives restarts)\n"
+                "Call campaign_search before repeated reconnaissance. Publish durable discoveries "
+                "with memory_update/campaign_publish. Offline jobs: stage a hash, submit a job, "
+                "poll status. Only accepted CTFd submissions count as solved.\n"
+                + self.campaign.search("", 25)
+            )
 
         self._proc = await asyncio.create_subprocess_exec(
             resolve_codex_executable(), "app-server",
@@ -501,12 +561,15 @@ class CodexSolver:
 
         self._step_count += 1
         traced_args = args
-        if tool_name == "memory_update":
+        if tool_name in {"memory_update", "campaign_publish"}:
             from backend.scenario_memory import memory_payload_trace_summary
             traced_args = memory_payload_trace_summary(args if isinstance(args, dict) else {})
+        elif tool_name == "campaign_get_credential":
+            traced_args = {"ref": args.get("ref", "")}
         self.tracer.tool_call(tool_name, traced_args, self._step_count)
 
-        if tool_name in {"memory_get", "memory_update"}:
+        if tool_name in {"memory_get", "memory_update", "campaign_publish",
+                         "campaign_get_credential", "campaign_search"}:
             loop_status = None
         else:
             loop_status = self.loop_detector.check(tool_name, traced_args)
@@ -528,8 +591,9 @@ class CodexSolver:
         else:
             result_text = str(result)
             traced_result = result_text[:500]
-            if tool_name in {"memory_get", "memory_update"}:
-                traced_result = "scenario memory updated" if tool_name == "memory_update" else "scenario memory read"
+            if tool_name in {"memory_get", "memory_update", "campaign_publish",
+                             "campaign_get_credential", "campaign_search", "campaign_stage_hash"}:
+                traced_result = "campaign/state access redacted"
             self.tracer.tool_result(tool_name, traced_result, self._step_count)
 
             if self._step_count % 5 == 0 and self.message_bus:
@@ -583,7 +647,23 @@ class CodexSolver:
         elif name == "memory_get":
             return self._memory_get()
         elif name == "memory_update":
-            return self._memory_update(args)
+            result = self._memory_update(args)
+            if self.campaign is not None:
+                await self.campaign.publish(args, self.meta.name)
+            return result
+        elif name == "campaign_search":
+            return self.campaign.search(args.get("query", ""), args.get("limit", 30)) if self.campaign else "Campaign unavailable"
+        elif name == "campaign_publish":
+            return await self.campaign.publish(args, self.meta.name) if self.campaign else "Campaign unavailable"
+        elif name == "campaign_get_credential":
+            return self.campaign.credential(args.get("ref", "")) if self.campaign else "Campaign unavailable"
+        elif name == "campaign_stage_hash":
+            return await self.campaign.stage_hash(self.sandbox, args.get("path", ""), self.meta.name) if self.campaign else "Campaign unavailable"
+        elif name == "campaign_job_submit":
+            return self.campaign.job_submit(args.get("artifact_id", ""), args.get("principal", ""),
+                                            args.get("hash_type", ""), args.get("engine", "john")) if self.campaign else "Campaign unavailable"
+        elif name == "campaign_job_status":
+            return self.campaign.job_status(args.get("job_id", "")) if self.campaign else "Campaign unavailable"
         return f"Unknown tool: {name}"
 
     async def run_until_done_or_gave_up(self) -> SolverResult:
@@ -705,6 +785,12 @@ class CodexSolver:
             list_distfiles(challenge_dir),
             memory_summary=memory_summary,
         )
+        if self.campaign is not None:
+            self._pending_prompt += (
+                "\n\nCROSS-SWARM CAMPAIGN MEMORY\n"
+                + self.campaign.search("", 30)
+                + "\nUse campaign_get_credential for secret refs when actually needed.\n"
+            )
         self.agent_name = f"{challenge_meta.name}/{self.model_id}"
         self._cost_usd = 0.0
         self._step_count = 0
