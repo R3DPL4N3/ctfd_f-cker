@@ -197,7 +197,7 @@ class CampaignStore:
 
     def search(self, query: str = "", limit: int = 30) -> dict[str, Any]:
         limit = max(1, min(int(limit), 100))
-        term = "%" + query.replace("%", "\\%").replace("_", "\\_") + "%"
+        term = "%" + query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
         with self.connect() as db:
             facts = db.execute("""SELECT kind,value,challenge,status,created_at
                 FROM facts WHERE kind LIKE ? ESCAPE '\\' OR value LIKE ? ESCAPE '\\'
