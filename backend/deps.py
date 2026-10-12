@@ -35,6 +35,7 @@ class SolverDeps:
     no_submit: bool = False
     notify_coordinator: Callable[[str], Coroutine[Any, Any, None]] | None = None
     memory: Any = None
+    campaign: Any = None
 
 
 @dataclass
@@ -61,3 +62,4 @@ class CoordinatorDeps:
     routing_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     handled_challenges: set[str] = field(default_factory=set)
     poller: Any = None
+    campaign: Any = None

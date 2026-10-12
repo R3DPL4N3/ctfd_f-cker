@@ -24,5 +24,9 @@ uv.lock
 
 # Runtime
 workspace/
+.ctfd-fcker-data/
+campaign-data/
+*.pot
+*.rec
 codex-schema-*/
 .claude/scheduled_tasks.lock

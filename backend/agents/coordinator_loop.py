@@ -45,10 +45,15 @@ def build_deps(
     specs = model_specs or list(DEFAULT_MODELS)
     Path(challenges_root).mkdir(parents=True, exist_ok=True)
 
+    from backend.campaign_service import CampaignService
+
+    campaign = CampaignService(settings)
+    campaign.resume_incomplete()
     deps = CoordinatorDeps(
         ctfd=ctfd,
         cost_tracker=cost_tracker,
         settings=settings,
+        campaign=campaign,
         model_specs=specs,
         challenges_root=challenges_root,
         no_submit=no_submit,
@@ -99,6 +104,9 @@ async def run_event_loop(
         len(poller.known_solved),
     )
 
+    if deps.campaign is not None:
+        for solved in poller.known_solved:
+            deps.campaign.store.mark_stage(solved, "accepted")
     unsolved = poller.known_challenges - poller.known_solved
     initial_msg = (
         f"CTF is LIVE. {len(poller.known_challenges)} eligible challenges, "
@@ -122,6 +130,9 @@ async def run_event_loop(
             if evt:
                 events.append(evt)
             events.extend(poller.drain_events())
+
+            if deps.campaign is not None:
+                await deps.campaign.poll_events()
 
             # Solved scenario swarms stay up until continuation or the unlock timeout.
             for evt in events:

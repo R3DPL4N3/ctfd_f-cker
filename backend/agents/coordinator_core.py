@@ -138,7 +138,11 @@ async def spawn_swarm_unlocked(deps: CoordinatorDeps, challenge_name: str) -> st
         model_specs=deps.model_specs,
         no_submit=deps.no_submit,
         coordinator_inbox=deps.coordinator_inbox,
+        campaign=deps.campaign,
     )
+    if deps.campaign is not None:
+        deps.campaign.register_bus(swarm.message_bus)
+        deps.campaign.store.mark_stage(meta.name, "active")
     if not deps.no_submit:
         _attach_scenario(deps, swarm, meta)
     deps.swarms[challenge_name] = swarm

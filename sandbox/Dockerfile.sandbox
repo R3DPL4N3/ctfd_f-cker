@@ -23,7 +23,7 @@ RUN apt-get update && apt-get install -y \
     # OCR
     tesseract-ocr tesseract-ocr-eng \
     # Crypto / encoding
-    openssl libssl-dev \
+    openssl libssl-dev john hashcat pocl-opencl-icd \
     # Build tools
     gcc g++ make cmake \
     # Python (system base)
