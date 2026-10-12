@@ -209,8 +209,9 @@ and `campaign_job_status`. Stage a hash file first, then submit a deduplicated
 offline John/Hashcat job. Jobs run as detached supervisors, can resume after
 application restart, and never authenticate against live targets. The Docker
 worker has no network access, no added capabilities, and bounded resources.
-After an update rebuild the `ctf-sandbox` Docker image; the Dockerfile now
-includes John/Hashcat. The operator must configure a host-accessible wordlist.
+For Docker jobs, rebuild the `ctf-sandbox` image with John Jumbo (the Dockerfile
+includes it). Hashcat is optional: provide an image with Hashcat installed or use
+the native runner with a host-installed Hashcat. A host-accessible wordlist is required.
 For locally installed tools use `CTF_CAMPAIGN_JOB_RUNNER=native`.
 
 Shared memory survives process and sandbox restarts, but live SSH tunnels,
