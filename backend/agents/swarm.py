@@ -45,6 +45,7 @@ class ChallengeSwarm:
     model_specs: list[str] = field(default_factory=lambda: list(DEFAULT_MODELS))
     no_submit: bool = False
     coordinator_inbox: asyncio.Queue | None = None
+    campaign: Any = None
 
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
     solvers: dict[str, SolverProtocol] = field(default_factory=dict)
@@ -100,6 +101,7 @@ class ChallengeSwarm:
                 submit_fn=_submit_fn,
                 message_bus=self.message_bus,
                 notify_coordinator=_notify,
+                campaign=self.campaign,
             )
 
         if provider == "codex":
@@ -116,6 +118,7 @@ class ChallengeSwarm:
                 submit_fn=_submit_fn,
                 message_bus=self.message_bus,
                 notify_coordinator=_notify,
+                campaign=self.campaign,
             )
 
         return self._create_pydantic_solver(model_spec)
@@ -147,6 +150,7 @@ class ChallengeSwarm:
         solver.deps.no_submit = self.no_submit
         solver.deps.submit_fn = lambda flag: self.try_submit_flag(flag, model_spec)
         solver.deps.notify_coordinator = self._make_notify_fn(model_spec)
+        solver.deps.campaign = self.campaign
         return solver
 
     def _gather_sibling_insights(self, exclude_model: str) -> str:
@@ -257,6 +261,8 @@ class ChallengeSwarm:
                 )
             display = submission.display
 
+        if accepted and self.campaign is not None:
+            self.campaign.store.mark_stage(self.meta.name, "accepted")
         if accepted and self.on_flag_accepted is not None:
             try:
                 await self.on_flag_accepted(self.meta.name, normalized)

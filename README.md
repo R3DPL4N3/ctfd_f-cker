@@ -181,6 +181,75 @@ If the winning solver does not support `continue_with_challenge()`, the system f
 
 Direct CTFd prerequisite relationships are deterministic and do not require the coordinator LLM to guess whether two challenges belong to the same scenario.
 
+## Shared Campaign Memory and Offline Jobs
+
+The host owns a durable campaign database and encrypted credential vault. Solvers
+read/write it only through explicit host-backed tools, not Docker mounts. Call
+`memory_update` to save local scenario intelligence and publish it to all active
+swarms. Campaign search results and broadcast events only include redacted credential
+references; `campaign_get_credential` retrieves secrets explicitly.
+
+Configure the following in your local `.env`:
+
+```env
+CTF_CAMPAIGN_ID=verimarkt-sydt
+CTF_CAMPAIGN_DATA_DIR=/Users/you/.local/share/ctfd-fcker/campaigns
+CTF_CAMPAIGN_WORDLIST=/Users/you/wordlists/rockyou.txt
+CTF_CAMPAIGN_JOB_RUNNER=docker
+```
+
+The campaign ID defaults to a stable hash of the CTFd URL and category whitelist.
+Use distinct IDs for unrelated competitions; default data directory is
+`~/.local/share/ctfd-fcker/campaigns`. SQLite and vault encryption key are private
+host files (0600). Back up the entire campaign directory. Do not commit it to Git.
+
+Codex and API-backed solvers expose `campaign_search`, `campaign_publish`,
+`campaign_get_credential`, `campaign_stage_hash`, `campaign_job_submit`,
+and `campaign_job_status`. Stage a hash file first, then submit a deduplicated
+offline John/Hashcat job. Jobs run as detached supervisors, can resume after
+application restart, and never authenticate against live targets. The Docker
+worker has no network access, no added capabilities, and bounded resources.
+For Docker jobs, rebuild the `ctf-sandbox` image with John Jumbo (the Dockerfile
+includes it). Hashcat is optional: provide an image with Hashcat installed or use
+the native runner with a host-installed Hashcat. A host-accessible wordlist is required.
+For locally installed tools use `CTF_CAMPAIGN_JOB_RUNNER=native`.
+
+### Importing yesterday's findings
+
+This feature does **not** retroactively recover deleted Docker workspaces or reconstruct
+secrets from trace logs. To seed a new campaign, prepare an operator-reviewed JSON file
+outside the repository with the same keys accepted by memory_update:
+
+~~~json
+{
+  "targets": [{"host": "10.20.103.110", "hostname": "WEB"}],
+  "credentials": [{"domain": "VERIMARKT", "username": "EXAMPLE_USER", "password": "REPLACE_WITH_VALIDATED_SECRET", "verified": true}],
+  "findings": ["WIN-103 is not accepted; any placeholder-looking flag remains unverified"]
+}
+~~~
+
+Do not use the example account as a real credential. Save actual validated values only
+in a private file and set owner-only permissions. Import **before** starting the swarm,
+using the same campaign ID as the next run:
+
+~~~bash
+chmod 600 /tmp/ctf-campaign-import.json
+CTF_CAMPAIGN_ID=verimarkt-sydt uv run python -m backend.campaign_cli \
+  /tmp/ctf-campaign-import.json --challenge WIN-103
+rm -f /tmp/ctf-campaign-import.json
+~~~
+
+Never commit the plaintext import file or vault key. New solver prompts include a
+redacted campaign snapshot; explicit credential retrieval remains a separate tool.
+Background jobs require an operator-installed John Jumbo or a compatible Docker
+image, plus CTF_CAMPAIGN_WORDLIST. They do not launch until the wordlist is configured.
+On an existing lab reset, revalidate old credentials and network sessions before use.
+
+Shared memory survives process and sandbox restarts, but live SSH tunnels,
+Kerberos tickets and sessions do not; revalidate those after lab reset.
+A candidate flag never marks a stage solved: only CTFd acceptance does.
+Locked challenges are not automatically attacked.
+
 ## Persistent Scenario Memory
 
 Multi-stage Codex and Claude Code solvers keep a small durable notebook inside the existing sandbox workspace. It is independent of the LLM conversation, so it still exists after context compaction.

@@ -23,7 +23,7 @@ RUN apt-get update && apt-get install -y \
     # OCR
     tesseract-ocr tesseract-ocr-eng \
     # Crypto / encoding
-    openssl libssl-dev \
+    openssl libssl-dev john hashcat pocl-opencl-icd \
     # Build tools
     gcc g++ make cmake \
     # Python (system base)
@@ -55,6 +55,13 @@ RUN apt-get update && apt-get install -y curl gnupg2 \
     && apt-get update && apt-get install -y podman buildah fuse-overlayfs slirp4netns \
     && rm -rf /var/lib/apt/lists/* \
     || echo "Podman install failed (non-fatal) — nested containers will not be available"
+
+# ── John Jumbo for network-isolated offline cracking workers ───────────────
+RUN git clone --depth=1 https://github.com/openwall/john.git /opt/john \
+    && cd /opt/john/src \
+    && ./configure --disable-opencl \
+    && make -s -j$(nproc) \
+    && ln -s /opt/john/run/john /usr/local/bin/john
 
 # ── radare2 ───────────────────────────────────────────────────────────────────
 RUN git clone --depth=1 https://github.com/radareorg/radare2 /tmp/r2 \

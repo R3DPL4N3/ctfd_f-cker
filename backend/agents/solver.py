@@ -40,6 +40,12 @@ from backend.solver_base import (
 )
 from backend.tools.flag import submit_flag
 from backend.tools.sandbox import (
+    campaign_get_credential,
+    campaign_job_status,
+    campaign_job_submit,
+    campaign_publish,
+    campaign_search,
+    campaign_stage_hash,
     bash,
     check_findings,
     list_files,
@@ -73,12 +79,15 @@ class TracingToolset(WrapperToolset[SolverDeps]):
         step = self.step_counter[0]
 
         traced_args = tool_args
-        if name == "memory_update":
+        if name in {"memory_update", "campaign_publish"}:
             from backend.scenario_memory import memory_payload_trace_summary
             traced_args = memory_payload_trace_summary(tool_args if isinstance(tool_args, dict) else {})
+        elif name == "campaign_get_credential":
+            traced_args = {"ref": tool_args.get("ref", "")}
         self.tracer.tool_call(name, traced_args, step)
 
-        if name in {"memory_get", "memory_update"}:
+        if name in {"memory_get", "memory_update", "campaign_publish",
+                    "campaign_get_credential", "campaign_search"}:
             loop_status = None
         else:
             loop_status = self.loop_detector.check(name, traced_args)
@@ -92,8 +101,9 @@ class TracingToolset(WrapperToolset[SolverDeps]):
 
         result_str = str(result) if result is not None else ""
         traced_result = result_str
-        if name in {"memory_get", "memory_update"}:
-            traced_result = "scenario memory updated" if name == "memory_update" else "scenario memory read"
+        if name in {"memory_get", "memory_update", "campaign_publish",
+                    "campaign_get_credential", "campaign_search", "campaign_stage_hash"}:
+            traced_result = "credential/state access redacted"
         self.tracer.tool_result(name, traced_result, step)
 
         # Inject loop warning alongside result on "warn" level
@@ -118,7 +128,9 @@ def _build_toolset(deps: SolverDeps) -> FunctionToolset[SolverDeps]:
     """Build the raw toolset for a solver agent."""
     tools = [bash, read_file, write_file, list_files, submit_flag, web_fetch,
              webhook_create, webhook_get_requests, check_findings, notify_coordinator,
-             memory_get, memory_update]
+             memory_get, memory_update, campaign_search, campaign_publish,
+             campaign_get_credential, campaign_stage_hash, campaign_job_submit,
+             campaign_job_status]
     if deps.use_vision:
         tools.append(view_image)
     return FunctionToolset(tools=tools, max_retries=4)
@@ -199,6 +211,15 @@ class Solver:
             container_arch=container_arch,
             include_memory=True,
         )
+        if self.deps.campaign is not None:
+            system_prompt += (
+                "\n\n## Shared Campaign State (survives restarts)\n"
+                "Search campaign_search before repeating reconnaissance. "
+                "Use memory_update/campaign_publish to share findings. "
+                "Stage and submit long offline jobs rather than blocking. "
+                "CTFd acceptance is the only proof that a flag is valid.\n"
+                + self.deps.campaign.search("", 25)
+            )
 
         model = resolve_model(self.model_spec, self.settings)
         model_settings = resolve_model_settings(self.model_spec)
@@ -333,6 +354,12 @@ class Solver:
             list_distfiles(challenge_dir),
             memory_summary=memory_summary,
         )
+        if self.deps.campaign is not None:
+            self._pending_prompt += (
+                "\n\nCROSS-SWARM CAMPAIGN INTELLIGENCE\n"
+                + self.deps.campaign.search("", 30)
+                + "\nUse campaign_get_credential only for required secret references.\n"
+            )
         self.agent_name = f"{challenge_meta.name}/{self.model_id}"
         self._step_count[0] = 0
         self._run_usage = RunUsage()
