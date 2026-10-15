@@ -139,10 +139,10 @@ AD-03 Domain Compromise
 
 When AD-02 directly requires AD-01, the deterministic control plane can continue the existing scenario.
 
-For supported solvers such as Codex, continuation preserves:
+For Codex and Claude Code solvers, continuation preserves:
 
 - the same solver object
-- the same Codex thread
+- the same model session
 - the same Docker sandbox
 - `/challenge/workspace`
 - downloaded files and scripts
@@ -183,7 +183,7 @@ Direct CTFd prerequisite relationships are deterministic and do not require the 
 
 ## Persistent Scenario Memory
 
-Multi-stage Codex solvers keep a small durable notebook inside the existing sandbox workspace. It is independent of the LLM conversation, so it still exists after Codex context compaction.
+Multi-stage Codex and Claude Code solvers keep a small durable notebook inside the existing sandbox workspace. It is independent of the LLM conversation, so it still exists after context compaction.
 
 Files:
 
@@ -194,12 +194,12 @@ Files:
 
 `scenario-state.json` is the canonical structured state (hosts, credentials, sessions, networks, findings, artifacts). `scenario-memory.md` is a compact projection of that state. The Markdown file records that a password or hash is available; it does not print the secret. The solver reads structured details with `memory_get`.
 
-Codex tools:
+Scenario memory tools:
 
 - `memory_update` — merge discoveries into the workspace files
 - `memory_get` — read the current structured memory
 
-Continuation keeps the same Codex thread, the same Docker sandbox, and the same workspace, so Linux 101 → Linux 102 → Linux 103 (or AD-01 → AD-02 → AD-03) reuse one memory file for as long as that scenario sandbox lives. When the scenario ends, normal workspace cleanup may remove it.
+Continuation keeps the same model session, the same Docker sandbox, and the same workspace, so Linux 101 → Linux 102 → Linux 103 (or AD-01 → AD-02 → AD-03) reuse one memory file for as long as that scenario sandbox lives. When the scenario ends, normal workspace cleanup may remove it.
 
 The coordinator never receives these secrets. Memory is not a vector database and does not leave the isolated workspace.
 
@@ -264,8 +264,11 @@ For the first prerequisite-chain milestone, continuation assumes the next CTFd c
 # Codex coordinator (default)
 uv run ctf-solve --coordinator codex ...
 
-# Claude SDK coordinator
+# Claude Code coordinator (Agent SDK)
 uv run ctf-solve --coordinator claude ...
+
+# Equivalent explicit CLI-facing name
+uv run ctf-solve --coordinator claude-cli ...
 ```
 
 The default Codex coordinator model is:
@@ -279,6 +282,8 @@ The default solver lineup currently contains:
 | Model | Provider | Notes |
 |---|---|---|
 | GPT-5.6 Sol | Codex CLI | high reasoning, persistent thread continuation |
+
+To use Claude Code for both roles, see [Claude CLI support](docs/claude-cli.md). The `claude-cli/*` and `claude-sdk/*` model prefixes use the same Claude Agent SDK backend, which runs the Claude Code runtime and uses your local Claude authentication. They do not invoke a separate `claude -p` subprocess for every turn.
 
 ## GOAD / Active Directory Benchmark Example
 
@@ -367,7 +372,7 @@ Each solver gets an isolated Docker container pre-loaded with CTF tools:
 - CTFd polling and auto-spawn
 - category whitelist filtering
 - persistent prerequisite-chain scenarios
-- same-thread Codex continuation
+- same-session Codex and Claude Code continuation
 - same-sandbox workspace persistence
 - deterministic control-plane flag submission
 - retry-safe submission classification
@@ -416,4 +421,4 @@ GitHub Actions runs both the scenario tests and the full test suite on every pus
 - Python 3.14+
 - Docker
 - `codex` CLI authenticated with `codex login`
-- `claude` CLI only if using the Claude coordinator/solver
+- Claude Code authentication only if using the Claude coordinator/solver

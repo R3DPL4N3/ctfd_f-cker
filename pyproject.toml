@@ -9,7 +9,7 @@ dependencies = [
     "genai-prices",
     "boto3",
     "aiodocker",
-    "claude-agent-sdk",
+    "claude-agent-sdk>=0.2.167",
     "httpx",
     "pyyaml",
     "rich",

@@ -1,4 +1,4 @@
-"""Claude Agent SDK solver — native tools with execution hooks.
+"""Claude Code solver through the Agent SDK and local Claude authentication.
 
 Uses Claude's native Bash tool, but intercepts every command via a PreToolUse
 hook and rewrites it to run inside the Docker sandbox via `docker exec`. Read,
@@ -21,6 +21,8 @@ from claude_agent_sdk import (
     HookMatcher,
     ResultMessage,
     TextBlock,
+    create_sdk_mcp_server,
+    tool,
 )
 
 from backend.cost_tracker import CostTracker
@@ -34,6 +36,16 @@ from backend.solver_base import CANCELLED, ERROR, FLAG_FOUND, GAVE_UP, QUOTA_ERR
 from backend.tracing import SolverTracer
 
 logger = logging.getLogger(__name__)
+
+
+def _deny_tool(reason: str) -> dict:
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }
+    }
 
 
 class ClaudeSolver:
@@ -83,15 +95,68 @@ class ClaudeSolver:
         self._confirmed = False
         self._findings = ""
         self._cost_usd = 0.0
+        self._last_session_cost_usd = 0.0
         self._bump_insights: str | None = None
         self._active_run: asyncio.Task | None = None
         self._run_state = "idle"
         self._closed = False
+        self._scenario_id: str | None = None
+        self._memory = None
+        self._pending_prompt: str | None = None
+
+    def _container_command(self, command: str) -> str:
+        """Keep every Bash call, including intercepted control calls, in Docker."""
+        if not self._container_id:
+            raise RuntimeError("Sandbox container is not available")
+        return f"docker exec -i {shlex.quote(self._container_id)} bash -c {shlex.quote(command)}"
+
+    def _init_memory(self) -> None:
+        workspace = getattr(self.sandbox, "workspace_dir", "")
+        if not workspace:
+            return
+        from backend.scenario_memory import ScenarioMemoryStore
+
+        self._memory = ScenarioMemoryStore(
+            workspace, scenario_id=self._scenario_id or "", current_stage=self.meta.name,
+        )
+        self._memory.ensure()
+
+    def _memory_get(self) -> str:
+        if self._memory is None:
+            self._init_memory()
+        if self._memory is None:
+            return "Scenario memory is unavailable because the workspace is not mounted."
+        return self._memory.structured_text()
+
+    def _memory_update(self, args: dict) -> str:
+        if self._memory is None:
+            self._init_memory()
+        if self._memory is None:
+            return "Scenario memory is unavailable because the workspace is not mounted."
+        from backend.scenario_memory import render_markdown
+
+        state = self._memory.update(args if isinstance(args, dict) else {})
+        return (
+            "Memory updated. Secrets are stored in scenario-state.json and are not echoed here.\n\n"
+            + render_markdown(state)
+        )
+
+    @property
+    def memory_path(self) -> str | None:
+        return str(self._memory.json_path) if self._memory is not None else None
+
+    def bind_scenario(self, scenario_id: str) -> None:
+        self._scenario_id = scenario_id
+        if self._memory is None:
+            self._init_memory()
+        if self._memory is not None:
+            self._memory.set_scenario_id(scenario_id)
 
     async def start(self) -> None:
         if self._client is not None:
             return
         await self.sandbox.start()
+        self._init_memory()
 
         self._container_id = self.sandbox.container_id
 
@@ -109,7 +174,7 @@ class ClaudeSolver:
         )
         system_prompt = sandbox_preamble + build_prompt(
             self.meta, distfile_names, container_arch=container_arch,
-            has_named_tools=False,
+            has_named_tools=False, include_memory=True,
         )
 
         # PreToolUse hook: rewrite Bash commands to run in the sandbox container.
@@ -119,7 +184,7 @@ class ClaudeSolver:
                 return await _sandbox_redirect_inner(input_data, tool_use_id, context)
             except Exception as e:
                 logger.warning(f"[{self.agent_name}] PreToolUse hook error: {e}")
-                return {}
+                return _deny_tool("Sandbox routing failed; tool execution was blocked.")
 
         async def _sandbox_redirect_inner(input_data, tool_use_id, context):
             if input_data.get("hook_event_name") != "PreToolUse":
@@ -127,20 +192,26 @@ class ClaudeSolver:
 
             tool_name = input_data.get("tool_name", "")
             tool_input = input_data.get("tool_input", {})
+            if not isinstance(tool_input, dict):
+                return _deny_tool("Invalid tool input; tool execution was blocked.")
 
-            # Step counting and loop detection for all tools
+            # Keep scenario credentials out of traces and loop history.
             self._step_count += 1
-            self.tracer.tool_call(tool_name, tool_input, self._step_count)
-            loop_status = self.loop_detector.check(tool_name, str(tool_input)[:200])
+            if tool_name in {"mcp__scenario_memory__memory_get", "mcp__scenario_memory__memory_update"}:
+                from backend.scenario_memory import memory_payload_trace_summary
+
+                traced_input = (
+                    memory_payload_trace_summary(tool_input)
+                    if tool_name.endswith("memory_update") else {}
+                )
+                loop_status = None
+            else:
+                traced_input = tool_input
+                loop_status = self.loop_detector.check(tool_name, str(tool_input)[:200])
+            self.tracer.tool_call(tool_name, traced_input, self._step_count)
             if loop_status == "break":
                 self.tracer.event("loop_break", tool=tool_name, step=self._step_count)
-                return {
-                    "hookSpecificOutput": {
-                        "hookEventName": "PreToolUse",
-                        "permissionDecision": "deny",
-                        "permissionDecisionReason": "Loop detected — try a different approach.",
-                    }
-                }
+                return _deny_tool("Loop detected — try a different approach.")
             warn_msg = ""
             if loop_status == "warn":
                 from backend.loop_detect import LOOP_WARNING_MESSAGE
@@ -148,6 +219,8 @@ class ClaudeSolver:
 
             if tool_name == "Bash":
                 command = tool_input.get("command", "")
+                if not isinstance(command, str):
+                    return _deny_tool("Invalid Bash command.")
 
                 # Intercept submit_flag commands — handle submission directly
                 flag_match = re.match(r"submit_flag\s+['\"]?(.+?)['\"]?\s*$", command.strip())
@@ -173,7 +246,7 @@ class ClaudeSolver:
                             "permissionDecision": "allow",
                             "updatedInput": {
                                 **tool_input,
-                                "command": f"echo {shlex.quote(result_msg)}",
+                                "command": self._container_command(f"echo {shlex.quote(result_msg)}"),
                             },
                         }
                     }
@@ -187,13 +260,12 @@ class ClaudeSolver:
                         "hookSpecificOutput": {
                             "hookEventName": "PreToolUse",
                             "permissionDecision": "allow",
-                            "updatedInput": {**tool_input, "command": "echo 'Message sent to coordinator.'"},
+                            "updatedInput": {**tool_input, "command": self._container_command("echo 'Message sent to coordinator.'")},
                         }
                     }
 
                 # Rewrite command to run in the Docker container
-                escaped = shlex.quote(command)
-                rewritten = f"docker exec -i {self._container_id} bash -c {escaped}"
+                rewritten = self._container_command(command)
 
                 result = {
                     "hookSpecificOutput": {
@@ -212,6 +284,9 @@ class ClaudeSolver:
             if tool_name in ("WebFetch", "WebSearch"):
                 return {"systemMessage": warn_msg} if warn_msg else {}
 
+            if tool_name in {"mcp__scenario_memory__memory_get", "mcp__scenario_memory__memory_update"}:
+                return {}
+
             # Everything else is denied — Glob/Grep/Read/Write/Edit/Agent/etc.
             # would run on the host filesystem, breaking sandbox isolation.
             # The model should use find/grep/cat/tee via bash instead.
@@ -221,14 +296,10 @@ class ClaudeSolver:
             elif tool_name in ("Read", "Write", "Edit", "NotebookEdit"):
                 redirect_hint = " Use cat/head/tail to read, and tee/cat>file to write via bash."
 
-            return {
-                "systemMessage": f"{tool_name} is not available — all work happens inside the Docker container.{redirect_hint}" if redirect_hint else "",
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "deny",
-                    "permissionDecisionReason": f"{tool_name} blocked — use bash for all operations inside the sandbox.",
-                },
-            }
+            result = _deny_tool(f"{tool_name} blocked — use bash for all operations inside the sandbox.")
+            if redirect_hint:
+                result["systemMessage"] = redirect_hint
+            return result
 
         async def trace_post_tool(input_data, tool_use_id, context):
             try:
@@ -240,8 +311,12 @@ class ClaudeSolver:
         async def _trace_post_tool_inner(input_data, tool_use_id, context):
             if input_data.get("hook_event_name") != "PostToolUse":
                 return {}
-            response_str = str(input_data.get("tool_response", ""))[:2000]
-            self.tracer.tool_result(input_data.get("tool_name", "?"), response_str[:500], self._step_count)
+            tool_name = input_data.get("tool_name", "?")
+            if tool_name in {"mcp__scenario_memory__memory_get", "mcp__scenario_memory__memory_update"}:
+                response_str = "scenario memory read" if tool_name.endswith("memory_get") else "scenario memory updated"
+            else:
+                response_str = str(input_data.get("tool_response", ""))[:500]
+            self.tracer.tool_result(tool_name, response_str, self._step_count)
 
             if self._step_count % 5 == 0 and self.message_bus:
                 from backend.tools.core import do_check_findings
@@ -258,14 +333,39 @@ class ClaudeSolver:
         from backend.models import effort_from_spec
         effort = effort_from_spec(self.model_spec)
 
+        @tool("memory_get", "Read durable scenario memory including stored credentials.", {})
+        async def memory_get(args: dict) -> dict:
+            return {"content": [{"type": "text", "text": self._memory_get()}]}
+
+        @tool("memory_update", "Merge durable targets, credentials, sessions, networks, findings, and artifacts into scenario memory.", {
+            "type": "object",
+            "properties": {
+                "targets": {"type": "array", "items": {"type": "object"}},
+                "credentials": {"type": "array", "items": {"type": "object"}},
+                "sessions": {"type": "array", "items": {"type": "object"}},
+                "networks": {"type": "array", "items": {"type": "object"}},
+                "findings": {"type": "array", "items": {"type": "string"}},
+                "artifacts": {"type": "array", "items": {"type": "string"}},
+            },
+        })
+        async def memory_update(args: dict) -> dict:
+            return {"content": [{"type": "text", "text": self._memory_update(args)}]}
+
+        memory_server = create_sdk_mcp_server(
+            name="scenario_memory", version="1.0.0", tools=[memory_get, memory_update],
+        )
+
         options = ClaudeAgentOptions(
             model=self.model_id,
             system_prompt=system_prompt,
             effort=effort,
             # Clear CLAUDECODE to prevent nested-session rejection when run from coordinator
-            env={"CLAUDECODE": ""},
-            allowed_tools=["Bash", "WebFetch", "WebSearch"],
-            permission_mode="bypassPermissions",
+            env={"CLAUDECODE": "", "ENABLE_TOOL_SEARCH": "false"},
+            setting_sources=[],
+            tools=["Bash", "WebFetch", "WebSearch"],
+            mcp_servers={"scenario_memory": memory_server},
+            allowed_tools=["Bash", "WebFetch", "WebSearch", "mcp__scenario_memory__memory_get", "mcp__scenario_memory__memory_update"],
+            permission_mode="dontAsk",
             output_format={"type": "json_schema", "schema": solver_output_json_schema()},
             hooks={
                 "PreToolUse": [
@@ -292,9 +392,13 @@ class ClaudeSolver:
         steps_before = self._step_count
         self._run_state = "running"
         self._active_run = asyncio.current_task()
+        result_error: str | None = None
 
         try:
-            if self._bump_insights:
+            if self._pending_prompt:
+                prompt = self._pending_prompt
+                self._pending_prompt = None
+            elif self._bump_insights:
                 prompt = (
                     "Your previous attempt did not find the flag. "
                     f"Insights from other agents:\n\n{self._bump_insights}\n\n"
@@ -319,8 +423,13 @@ class ClaudeSolver:
 
                 elif isinstance(message, ResultMessage):
                     self._session_id = message.session_id
-                    turn_cost = getattr(message, "total_cost_usd", 0.0)
-                    self._cost_usd += turn_cost
+                    if message.subtype != "success":
+                        result_error = str(getattr(message, "result", "") or message.subtype)
+                    session_cost = getattr(message, "total_cost_usd", None)
+                    if session_cost is not None:
+                        # SDK result cost includes earlier turns in this session.
+                        self._cost_usd += max(0.0, session_cost - self._last_session_cost_usd)
+                        self._last_session_cost_usd = session_cost
                     msg_usage = getattr(message, "usage", None) or {}
                     if not isinstance(msg_usage, dict):
                         msg_usage = vars(msg_usage) if hasattr(msg_usage, "__dict__") else {}
@@ -341,6 +450,16 @@ class ClaudeSolver:
                             self._confirmed = True
 
             self.tracer.event("turn_complete", duration=round(time.monotonic() - t0, 1), cost=round(self._cost_usd, 4))
+
+            if self.cancel_event.is_set():
+                return self._result(CANCELLED)
+            if result_error:
+                self._findings = f"Claude turn failed: {result_error}"
+                self.tracer.event("turn_failed", error=result_error)
+                lowered = result_error.lower()
+                if any(word in lowered for word in ("quota", "rate", "overloaded", "capacity", "usage limit")):
+                    return self._result(QUOTA_ERROR)
+                return self._result(ERROR)
 
             # Also check if flag was confirmed via submit_flag in bash
             if self._confirmed and self._flag:
@@ -371,6 +490,51 @@ class ClaudeSolver:
         self.loop_detector.reset()
         self.tracer.event("bump", insights=insights[:500])
         logger.info(f"[{self.agent_name}] Bumped with insights (session {self._session_id})")
+
+    async def continue_with_challenge(self, challenge_meta: ChallengeMeta, challenge_dir: str) -> None:
+        """Reuse the Claude session and Docker workspace for a related stage."""
+        from backend.prompts import build_continuation_prompt
+        from backend.sandbox import stage_challenge_into_workspace
+
+        if self._client is None or not self.sandbox.workspace_dir:
+            raise RuntimeError("Cannot continue before the Claude solver has started")
+
+        container_path = stage_challenge_into_workspace(
+            self.sandbox.workspace_dir, challenge_dir, challenge_meta.name,
+        )
+        previous = self.meta.name
+        if self._memory is None:
+            self._init_memory()
+        memory_summary = None
+        if self._memory is not None:
+            self._memory.advance_stage(previous, challenge_meta.name)
+            memory_summary = self._memory.compact_markdown()
+
+        self.challenge_dir = challenge_dir
+        self.meta = challenge_meta
+        self._confirmed = False
+        self._flag = None
+        self._findings = ""
+        self._bump_insights = None
+        self._pending_prompt = build_continuation_prompt(
+            challenge_meta, container_path, list_distfiles(challenge_dir),
+            memory_summary=memory_summary,
+        )
+        self.agent_name = f"{challenge_meta.name}/{self.model_id}"
+        self._step_count = 0
+        self._cost_usd = 0.0
+        self.loop_detector.reset()
+        self.tracer.event(
+            "scenario_continued", from_challenge=previous,
+            to_challenge=challenge_meta.name, session_id=self._session_id,
+            sandbox_reused=True,
+        )
+        self.tracer.close()
+        self.tracer = SolverTracer(challenge_meta.name, self.model_id)
+        self.tracer.event(
+            "scenario_continued", from_challenge=previous,
+            to_challenge=challenge_meta.name, session_id=self._session_id,
+        )
 
     def _result(self, status: str, run_steps: int | None = None, run_cost: float | None = None) -> SolverResult:
         self.tracer.event("finish", status=status, flag=self._flag, confirmed=self._confirmed, cost_usd=round(self._cost_usd, 4))

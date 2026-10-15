@@ -77,7 +77,7 @@ class ChallengeSwarm:
     def _create_solver(self, model_spec: str):
         """Create the right solver type based on provider.
 
-        - claude-sdk/* → ClaudeSolver (Claude Agent SDK, subscription-first)
+        - claude-sdk/*, claude-cli/* → ClaudeSolver (Claude Code runtime via Agent SDK)
         - codex/* → CodexSolver (Codex App Server, subscription-first)
         - bedrock/*, azure/*, zen/*, google/* → Pydantic AI Solver (API, explicit only)
         """
@@ -86,7 +86,7 @@ class ChallengeSwarm:
         def _submit_fn(flag): return self.try_submit_flag(flag, model_spec)
         _notify = self._make_notify_fn(model_spec)
 
-        if provider == "claude-sdk":
+        if provider in {"claude-sdk", "claude-cli"}:
             from backend.agents.claude_solver import ClaudeSolver
             return ClaudeSolver(
                 model_spec=model_spec,

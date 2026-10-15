@@ -150,6 +150,7 @@ async def run_claude_coordinator(
         model=resolved_model,
         system_prompt=COORDINATOR_PROMPT,
         env={"CLAUDECODE": ""},
+        setting_sources=[],
         mcp_servers={"coordinator": mcp_server},
         allowed_tools=list(allowed),
         permission_mode="bypassPermissions",
